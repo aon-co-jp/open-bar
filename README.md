@@ -63,8 +63,8 @@ open-bar pair <folder>                         同名の映像+音声を自動�
 
 A **quality-first audio/video player** in Rust, in the spirit of [foobar2000](https://www.foobar2000.org/): PCM, DSD, Opus, WAV, MP3 and more, plus MP4/MKV video, in **free combinations** (e.g. MP4 video + DSD audio). If the hardware supports DSD/MQA the stream is sent as is; otherwise DSD is automatically converted to PCM.
 
-**Status (2026-09-20, first release = playback-engine core): it cannot play sound yet.** Decoding, probing, playback planning and conversion work; device output (WASAPI exclusive / ASIO / DoP) and video display come next.
+**Status (2026-09-20): audio playback works from the CLI.** Shared-mode and WASAPI-exclusive PCM playback are verified on a real USB DAC (MUSE HiFi M3Ultra); gapless queues and ReplayGain work. DoP is implemented but **not yet verified on a DoP-capable DAC** (sending DoP to a non-DoP DAC produces loud noise, so it was not tried). ASIO native DSD (needs Steinberg's SDK licence), the GUI and video display are next.
 
 Verified with real files: WAV/FLAC/MP3/AAC/Vorbis/Opus/MKA plus audio inside MP4/MKV/WebM (1 kHz tone amplitude and duration checked per format); DSF/DSDIFF reading, DSD→PCM and DoP via `open-mqa-dsd` (real DSD256 probed/planned); playback planning (native DSD / DoP / automatic PCM fallback); MQA detection by tag. **MQA is never decoded or reimplemented** (patented, proprietary, not lossless): on an MQA-capable DAC the player only needs to pass the stream bit-perfectly (no volume/EQ/resampling) and the DAC unfolds it; otherwise it plays as ordinary PCM and says why. DST-compressed DSDIFF is refused explicitly. Opus in WebM needs ffmpeg as a fallback.
 
-Roadmap: audio output (WASAPI exclusive + DoP, ASIO DSD), UI (Tauri), video via libmpv with audio-master sync, make-disk integration.
+Roadmap: verify DoP on hardware, UI (Tauri), video via libmpv with audio-master sync, ASIO DSD, make-disk integration.
