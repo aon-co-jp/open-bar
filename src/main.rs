@@ -1,12 +1,13 @@
 //! open-bar CLI(初版)。再生エンジンの下調べ用: `probe` / `plan` / `decode`。
 //! 音声デバイスへの実出力は次の段階(README参照)。
 
-use open_bar::{combo, media, pcm, plan};
+use open_bar::{combo, media, output, pcm, plan};
 use std::process::ExitCode;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方 / usage:\n  open-bar probe <file>                       ファイル情報(JSON)\n  open-bar plan <file> [--dsd none|dop|native] [--max-rate HZ] [--mqa-dac]\n                                              出力先の能力から再生計画(JSON)\n  open-bar decode <file> <out.wav>            デコードして24bit WAVへ(DSDは自動でPCM化)\n  open-bar pair <folder>                      同名の映像+音声を自動で組み合わせて表示"
+        "使い方 / usage:\n  open-bar probe <file>                       ファイル情報(JSON)\n  open-bar plan <file> [--dsd none|dop|native] [--max-rate HZ] [--mqa-dac]\n                                              出力先の能力から再生計画(JSON)\n  open-bar decode <file> <out.wav>            デコードして24bit WAVへ(DSDは自動でPCM化)\n  open-bar play <file> [--volume 0.0-1.0] [--seconds N]   既定の出力デバイスで再生(共有モード。DSDは自動でPCM化)
+  open-bar pair <folder>                      同名の映像+音声を自動で組み合わせて表示"
     );
     ExitCode::from(2)
 }
@@ -90,6 +91,62 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                     println!("{} → {} ({rate}Hz, {channels}ch, 24bit)", args[1], args[2]);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("play") if args.len() >= 2 => {
+            let mut opts = output::PlayOpts::default();
+            let mut i = 2;
+            while i + 1 < args.len() {
+                match args[i].as_str() {
+                    "--volume" => opts.volume = args[i + 1].parse().unwrap_or(1.0),
+                    "--seconds" => opts.max_seconds = args[i + 1].parse().ok(),
+                    _ => return usage(),
+                }
+                i += 2;
+            }
+            let info = media::probe(&args[1]);
+            let pcm_data = if info.kind == media::MediaKind::Dsd {
+                let s = match open_mqa_dsd::read_dsd_file(&args[1]) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                // 先頭からN秒だけ再生する指定なら、変換する前にDSDを切り詰めて時間を節約する
+                let mut s = s;
+                if let Some(sec) = opts.max_seconds {
+                    let keep = (s.rate_hz as f64 / 8.0 * sec) as usize;
+                    s.channels.iter_mut().for_each(|c| c.truncate(keep));
+                }
+                // 共有モードはDoPを通せないので、PCM化(機器が受けやすい176.4kHz以下)して再生する
+                let rate = plan::dsd_pcm_candidates(s.rate_hz).into_iter().find(|r| *r <= 176_400).unwrap_or(44_100);
+                let cfg = open_mqa_dsd::DsdToPcm { out_rate_hz: rate, cutoff_hz: 40_000.0 };
+                match open_mqa_dsd::dsd_to_pcm(&s, cfg) {
+                    Ok((v, r)) => pcm::Pcm { sample_rate: r, channels: s.channels.len(), samples: v.iter().map(|x| x * 0.5).collect(), bits_per_sample: None },
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                match pcm::decode_file(&args[1]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            };
+            match output::play_blocking(&pcm_data, &opts) {
+                Ok(r) => {
+                    println!("再生しました: {} / デバイス {}Hz {}ch / 変換={} / {}フレーム / {:.2}秒", args[1], r.device_rate_hz, r.device_channels, r.resampled, r.frames_consumed, r.elapsed_secs);
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

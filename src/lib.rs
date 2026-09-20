@@ -7,10 +7,11 @@
 //!   DoPにするか自動でPCMへ変換するかを決める再生計画。
 //! - [`combo`]: 「MP4動画+DSD音声」のような、映像と音声を別ファイルで自由に組み合わせる再生セット。
 //!
-//! 音声デバイスへの実出力(WASAPI排他/ASIO)と動画の表示は次の段階(README参照)。
+//! - [`output`]: 音声出力(第1段階=cpal共有モード+高品質リサンプル)。WASAPI排他/DoP/ASIOと動画表示は次の段階(README参照)。
 pub mod combo;
 pub mod media;
 pub mod mqa;
+pub mod output;
 pub mod pcm;
 pub mod plan;
 pub use open_mqa_dsd as dsd;
