@@ -1,0 +1,28 @@
+[package]
+name = "open-bar"
+version = "0.1.0"
+edition = "2021"
+description = "open-bar: foobar2000-inspired high-resolution audio/video player core (PCM/DSD/DoP/MQA-passthrough planning) in Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aon-co-jp/open-bar"
+
+[lib]
+name = "open_bar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "open-bar"
+path = "src/main.rs"
+
+[dependencies]
+# 主要な音声フォーマットのデコード・デマルチプレクス(純Rust)。MKV/MP4の音声トラックも読める。
+symphonia = { version = "0.5", features = ["all"] }
+# DoP(DSD over PCM)パッキングと純Rust Opusデコード(自リポジトリ群の open-mqa)。
+open-mqa = { git = "https://github.com/aon-co-jp/open-mqa", rev = "2d94ada", default-features = false, features = ["opus"] }
+# DSD(DSF/DSDIFF)読み込み・DSD→PCM・DoP(open-mqa-dsd)。
+open-mqa-dsd = { git = "https://github.com/aon-co-jp/open-mqa-dsd", rev = "ce94b46" }
+# CPU命令セット検出(DSD→PCM変換の高速カーネル選択に使う、aon-co-jp共通)。
+open-cpu = { git = "https://github.com/aon-co-jp/open-cpu" }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
