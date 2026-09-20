@@ -112,3 +112,23 @@ fn a_fake_mqa_flac_is_flagged_by_its_encoder_tag() {
     assert!(media::probe(&tagged).is_mqa, "MQAENCODERタグ付きFLACはMQAと判定される(タグベースの簡易判定)");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn gapless_concatenation_has_no_gap_and_replaygain_scales_the_second_track() {
+    if !ffmpeg_ok() {
+        return;
+    }
+    let dir = tmpdir("gapless");
+    let a = make(&dir, "a.flac", &["-c:a", "flac"]);
+    let b = make(&dir, "b.flac", &["-c:a", "flac", "-metadata", "REPLAYGAIN_TRACK_GAIN=-6.02 dB"]);
+    let plain = open_bar::playlist::load_gapless(&[a.clone(), b.clone()], false).unwrap();
+    assert_eq!(plain.samples.len(), 2 * 48_000 * 2, "2秒+2秒がそのまま繋がる(隙間・重複なし)");
+    let first = tone_amplitude(&plain.samples[..48_000], 1, 48_000, 1000.0);
+    let second_start = 48_000 * 2; // 2曲目の先頭
+    let second = tone_amplitude(&plain.samples[second_start..second_start + 48_000], 1, 48_000, 1000.0);
+    assert!((first - 0.5).abs() < 0.01 && (second - 0.5).abs() < 0.01, "ゲインなしなら両方0.5: {first} {second}");
+    let rg = open_bar::playlist::load_gapless(&[a, b], true).unwrap();
+    let second_rg = tone_amplitude(&rg.samples[second_start..second_start + 48_000], 1, 48_000, 1000.0);
+    assert!((second_rg - 0.25).abs() < 0.01, "ReplayGain -6.02dBで2曲目が半分の0.25になる: {second_rg}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

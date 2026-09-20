@@ -6,13 +6,18 @@
 
 ## 現状(2026-09-20、初版 = 再生エンジンの中核)
 
-**まだ音を出す(再生する)機能はありません。** 読み込み・判別・再生計画・変換までが動きます。音声デバイスへの出力(WASAPI排他/ASIO/DoP)と動画表示は次の段階です(下記ロードマップ)。
+**音声の再生は動きます(CLI)。** 共有モードとWASAPI排他モードのPCM再生は、実機のUSB DAC(MUSE HiFi M3Ultra)で確認しました。DoPは実装済みですが、**DoP対応DACでの実機確認はまだ**です(非対応DACだと大音量のノイズになるため、こちらでは試していません)。ASIOネイティブDSD(Steinbergライセンスが必要なSDK)、画面(UI)、動画表示は次の段階です。
 
 | 機能 | 状態 |
 |---|---|
 | 音声デコード: WAV/FLAC/MP3/AAC(M4A)/ALAC/Vorbis/AIFF/Opus、MKV・MP4・WebM内の音声 | ✅ 実ファイルで確認(1kHz正弦波の振幅・長さを全形式で検証) |
 | DSD: DSF・DSDIFF(非圧縮)の読み込み、DSD→PCM変換、DoP化 | ✅ (`open-mqa-dsd`) 実DSD256でprobe/plan確認 |
 | 再生計画: DSDネイティブ/DoP/PCM自動変換、PCMの上限内での縮小 | ✅ 単体テスト |
+| 音声出力(共有モード): cpal+高品質sincリサンプル | ✅ 実機(デバイスが実時間で消費することを確認: `open-bar play`) |
+| 音声出力(WASAPI排他、ビットパーフェクト) | ✅ 実機のUSB DACで44.1kHz/24bitを確認(`--exclusive`) |
+| DoP出力(排他モード) | ⚠ 実装済み・バイト配置は単体テスト。**DoP対応DACでの実機確認は未実施**(`--dop`) |
+| ギャップレス連結・ReplayGain(`queue --rg`) | ✅ 実ファイルで隙間なし・-6dBで振幅半分を確認 |
+| ASIOネイティブDSD | ❌ 未実装(ASIO SDKのライセンスが必要) |
 | MQA: タグでの判別と、MQA対応DACへのビットパーフェクト素通しの判断 | ✅ 判別・計画のみ(**復号はしない**) |
 | 映像+音声の自由な組み合わせ(`.obar.json`、同名ファイルの自動ペアリング) | ✅ 形式・検証・ペアリング(同期再生は次段階) |
 | WebM内Opusなどsymphoniaが読めない形式 | ffmpegがあればフォールバック(実ファイルで確認) |
@@ -28,6 +33,10 @@
 open-bar probe <file>                          ファイル情報(JSON)
 open-bar plan <file> --dsd none|dop|native --max-rate 192000 [--mqa-dac]
 open-bar decode <file> <out.wav>               24bit WAVへ(DSDは自動PCM化)
+open-bar play <file> [--volume V] [--seconds N]  既定デバイスで再生(共有モード。DSDは自動PCM化)
+open-bar play <file> --exclusive [--bits 16|24]  WASAPI排他(Windows、ビットパーフェクト)
+open-bar play <file.dsf> --dop                  DoP(DoP対応DACのみ!非対応だとノイズ)
+open-bar queue [--rg] <file>...                 ギャップレス連続再生(--rg=ReplayGain)
 open-bar pair <folder>                         同名の映像+音声を自動で組み合わせ
 ```
 
@@ -40,7 +49,7 @@ open-bar pair <folder>                         同名の映像+音声を自動�
 
 ## ロードマップ
 
-1. 音声出力(WASAPI排他+DoP、ASIO DSD、cpal共有モード)+ギャップレス再生+ReplayGain
+1. ✅ 音声出力(共有・WASAPI排他・DoP)+ギャップレス+ReplayGain(済)。ASIO DSDは未実装
 2. UI(Tauri、foobar2000風のプレイリスト/カスタマイズ)
 3. 映像(libmpv)と音声主導の同期(`Combo`)
 4. `make-disk`との連携(「動画+DSD音声」セットの書き出し)、ライブラリ管理
