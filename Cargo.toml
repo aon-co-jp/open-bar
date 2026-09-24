@@ -6,6 +6,9 @@ description = "open-bar: foobar2000-inspired high-resolution audio/video player 
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aon-co-jp/open-bar"
 
+[workspace]
+members = ["app/src-tauri"]
+
 [lib]
 name = "open_bar"
 path = "src/lib.rs"
