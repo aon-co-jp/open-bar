@@ -87,6 +87,10 @@ pub fn resample(samples: &[f32], channels: usize, from: u32, to: u32) -> Result<
 }
 
 /// PCMのチャンネル数をデバイスのチャンネル数へ合わせる(モノラル→複製、多い分は切り捨て、足りない分は無音)。
+pub fn map_channels_pub(samples: &[f32], from: usize, to: usize) -> Vec<f32> {
+    map_channels(samples, from, to)
+}
+
 fn map_channels(samples: &[f32], from: usize, to: usize) -> Vec<f32> {
     if from == to {
         return samples.to_vec();

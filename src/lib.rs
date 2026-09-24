@@ -8,6 +8,7 @@
 //! - [`combo`]: 「MP4動画+DSD音声」のような、映像と音声を別ファイルで自由に組み合わせる再生セット。
 //!
 //! - [`exclusive`](Windows): WASAPI排他モードのビットパーフェクト出力(PCM・DoP)。
+//! - [`player`]: 対話的なプレーヤー(再生/一時停止/停止/シーク/音量/自動送り)。UIから使う。
 //! - [`output`]: 音声出力(第1段階=cpal共有モード+高品質リサンプル)。WASAPI排他/DoP/ASIOと動画表示は次の段階(README参照)。
 pub mod combo;
 #[cfg(windows)]
@@ -17,5 +18,6 @@ pub mod mqa;
 pub mod output;
 pub mod pcm;
 pub mod plan;
+pub mod player;
 pub mod playlist;
 pub use open_mqa_dsd as dsd;

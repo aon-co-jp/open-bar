@@ -132,3 +132,46 @@ fn gapless_concatenation_has_no_gap_and_replaygain_scales_the_second_track() {
     assert!((second_rg - 0.25).abs() < 0.01, "ReplayGain -6.02dBで2曲目が半分の0.25になる: {second_rg}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 実デバイスで対話プレーヤーを動かす: 再生→位置が進む→一時停止で止まる→シーク→停止。
+#[test]
+fn interactive_player_plays_pauses_seeks_and_stops_on_the_real_device() {
+    if !ffmpeg_ok() || cpal::traits::HostTrait::default_output_device(&cpal::default_host()).is_none() {
+        return;
+    }
+    let dir = tmpdir("player");
+    let a = make(&dir, "a.flac", &["-c:a", "flac"]);
+    let b = make(&dir, "b.flac", &["-c:a", "flac"]);
+    let p = open_bar::player::Player::new();
+    p.set_volume(0.05); // 小さい音量(テスト音)
+    p.set_playlist(vec![a, b]);
+    p.play(0);
+    let wait = |cond: &dyn Fn(&open_bar::player::Status) -> bool, secs: f64| {
+        let t0 = std::time::Instant::now();
+        loop {
+            let s = p.status();
+            if cond(&s) {
+                return s;
+            }
+            assert!(t0.elapsed().as_secs_f64() < secs, "タイムアウト: {s:?}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    let s = wait(&|s| s.state == open_bar::player::PlayState::Playing && s.position_secs > 0.3, 10.0);
+    assert!((s.duration_secs - 2.0).abs() < 0.1, "{s:?}");
+    p.pause();
+    let paused = wait(&|s| s.state == open_bar::player::PlayState::Paused, 3.0);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let later = p.status();
+    assert!((later.position_secs - paused.position_secs).abs() < 0.15, "一時停止中は位置が進まない: {} → {}", paused.position_secs, later.position_secs);
+    p.seek(1.5);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(p.status().position_secs >= 1.4, "シーク: {}", p.status().position_secs);
+    p.resume();
+    // 1曲目が終わると自動で2曲目へ進む
+    let s2 = wait(&|s| s.index == Some(1) && s.state == open_bar::player::PlayState::Playing, 10.0);
+    assert!(s2.path.unwrap().ends_with("b.flac"));
+    p.stop();
+    wait(&|s| s.state == open_bar::player::PlayState::Stopped, 3.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
