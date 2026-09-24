@@ -34,3 +34,7 @@ serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.24"
+
+# 依存クレート(rubatoのsinc補間など)はdebugビルドでも最適化する(テストが遅すぎるため)
+[profile.dev.package."*"]
+opt-level = 3
