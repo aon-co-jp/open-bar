@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>open-bar</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="toolbar">
+      <div class="transport">
+        <button id="prev-btn" title="前の曲 / Previous">⏮</button>
+        <button id="play-btn" class="primary" title="再生・一時停止 / Play・Pause (Space)">▶</button>
+        <button id="stop-btn" title="停止 / Stop">⏹</button>
+        <button id="next-btn" title="次の曲 / Next">⏭</button>
+      </div>
+      <div class="seek">
+        <span id="pos-label">0:00</span>
+        <input id="seek" type="range" min="0" max="1000" value="0" />
+        <span id="dur-label">0:00</span>
+      </div>
+      <label class="vol" title="音量 / Volume">🔊 <input id="volume" type="range" min="0" max="100" value="80" /></label>
+    </header>
+
+    <div class="actions">
+      <button id="add-files-btn">ファイルを追加… / Add files…</button>
+      <button id="add-folder-btn">フォルダを追加… / Add folder…</button>
+      <button id="clear-btn">クリア / Clear</button>
+      <span class="hint">ダブルクリックで再生 / Double-click to play</span>
+    </div>
+
+    <main>
+      <table id="playlist">
+        <thead>
+          <tr><th class="c-num">#</th><th>ファイル / File</th><th class="c-fmt">形式 / Format</th><th class="c-dur">長さ / Length</th></tr>
+        </thead>
+        <tbody id="playlist-body"></tbody>
+      </table>
+      <p id="empty" class="empty">
+        ここにファイルを追加してください。PCM(WAV/FLAC/MP3/AAC/Opus…)、DSD(DSF/DFF)、動画の音声(MP4/MKV…)に対応します。<br />
+        Add files here. PCM (WAV/FLAC/MP3/AAC/Opus…), DSD (DSF/DFF) and the audio of videos (MP4/MKV…) are supported.
+      </p>
+    </main>
+
+    <footer class="status">
+      <span id="status-main">停止 / Stopped</span>
+      <span id="status-route"></span>
+      <span id="status-msg"></span>
+    </footer>
+    <script src="main.js"></script>
+  </body>
+</html>

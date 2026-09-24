@@ -1,0 +1,16 @@
+[package]
+name = "open-bar-app"
+version = "0.1.0"
+description = "open-bar: high-resolution audio/video player (GUI)"
+authors = ["aon-co-jp"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+open-bar = { path = "../.." }
+tauri = { version = "2" }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
