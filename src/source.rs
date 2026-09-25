@@ -114,9 +114,23 @@ impl Source for DsdPcmSource {
     }
 }
 
-/// DoPワード(24bit符号付き)を±1.0へ正規化する係数。2^23で割るので、整数→f32→整数の往復が厳密にできる。
-pub const DOP_SCALE: f32 = 8_388_608.0;
+/// DoPのペイロード(DSD 2バイト=16bit)を0.0〜1.0未満へ正規化する係数。2^16で割るので、整数→f32→整数の往復が厳密にできる。
+pub const DOP_SCALE: f32 = 65_536.0;
+/// DSDの無音パターン(0x69)を2バイト並べたDoPペイロード。再生の隙間(一時停止・シーク・音切れ)を埋めるのに使う。
+pub const DOP_IDLE_PAYLOAD: u16 = 0x6969;
 
+/// DoPの24bitワード(符号付き)を作る。マーカーは**出力側**が連続した0x05/0xFAの交互で付ける(一時停止やシークを挟んでも位相が崩れない)。
+pub fn dop_word(marker_even: bool, payload: u16) -> i32 {
+    let marker: i32 = if marker_even { 0x05 } else { 0xFA };
+    ((marker << 16) | payload as i32) << 8 >> 8 // 24bitの符号拡張
+}
+
+/// リング(f32)に載せたDoPペイロードを整数へ戻す。
+pub fn dop_payload_from_f32(v: f32) -> u16 {
+    (v * DOP_SCALE).round().clamp(0.0, 65_535.0) as u16
+}
+
+/// DSDをDoPの**ペイロード**(マーカー無し)として供給する。マーカーの付与は出力側(`player`の排他スレッド)が行う。
 pub struct DopSource {
     stream: DsdStream,
 }
@@ -126,13 +140,12 @@ impl DopSource {
         DopSource { stream }
     }
 
-    /// `idx`番目のDoPワード(チャンネル`c`)を符号付き24bit整数で返す。マーカーは0x05/0xFAを交互、末尾はDSD無音(0x69)で埋める。
-    pub fn word(&self, c: usize, idx: usize) -> i32 {
+    /// `idx`番目のフレーム(チャンネル`c`)のペイロード。末尾はDSD無音(0x69)で埋める。
+    pub fn payload(&self, c: usize, idx: usize) -> u16 {
         let bytes = &self.stream.channels[c];
-        let marker: i32 = if idx % 2 == 0 { 0x05 } else { 0xFA };
-        let b0 = bytes.get(2 * idx).copied().unwrap_or(0x69) as i32;
-        let b1 = bytes.get(2 * idx + 1).copied().unwrap_or(0x69) as i32;
-        ((marker << 16) | (b0 << 8) | b1) << 8 >> 8 // 24bitの符号拡張
+        let b0 = bytes.get(2 * idx).copied().unwrap_or(0x69) as u16;
+        let b1 = bytes.get(2 * idx + 1).copied().unwrap_or(0x69) as u16;
+        (b0 << 8) | b1
     }
 }
 
@@ -156,7 +169,7 @@ impl Source for DopSource {
         let mut out = Vec::with_capacity(n * ch);
         for f in 0..n {
             for c in 0..ch {
-                out.push(self.word(c, start as usize + f) as f32 / DOP_SCALE);
+                out.push(self.payload(c, start as usize + f) as f32 / DOP_SCALE);
             }
         }
         out
@@ -175,19 +188,26 @@ mod tests {
     }
 
     #[test]
-    fn dop_source_words_round_trip_exactly_through_f32() {
+    fn dop_source_payloads_round_trip_exactly_and_words_get_alternating_markers() {
         let s = DopSource::new(stream());
         assert_eq!(s.rate_hz(), 176_400);
         assert_eq!(s.total_frames(), 3, "5バイト→DoP 3フレーム(最後はDSD無音で埋める)");
         let v = s.read(0, 10);
         assert_eq!(v.len(), 6);
-        // f32→整数(排他出力の変換と同じ)で、元のDoPワードに厳密に戻る
-        let back: Vec<i32> = v.iter().map(|x| (x * DOP_SCALE).round() as i32).collect();
-        assert_eq!(back[0], 0x05_AA_55);
-        assert_eq!(back[1], 0x05_01_02);
-        assert_eq!(back[2], (0xFA_12_34i32) << 8 >> 8, "マーカー0xFAは符号付き24bitで負の値");
-        assert_eq!(back[4], 0x05_FF_69, "端数バイトはDSD無音0x69で埋まる");
-        assert!(v.iter().all(|x| (-1.0..1.0).contains(x)));
+        let back: Vec<u16> = v.iter().map(|x| dop_payload_from_f32(*x)).collect();
+        assert_eq!(back[0], 0xAA55);
+        assert_eq!(back[1], 0x0102);
+        assert_eq!(back[2], 0x1234);
+        assert_eq!(back[4], 0xFF69, "端数バイトはDSD無音0x69で埋まる");
+        // マーカーは出力側が連続した位相で付ける(0x05/0xFA交互)
+        assert_eq!(dop_word(true, 0xAA55), 0x05_AA_55);
+        assert_eq!(dop_word(false, 0x1234), (0xFA_12_34i32) << 8 >> 8, "0xFAは符号付き24bitで負");
+        assert_eq!(dop_word(true, DOP_IDLE_PAYLOAD), 0x05_69_69);
+        // 全ペイロード値がf32を経由しても厳密に戻る
+        for p in [0u16, 1, 0x6969, 0x8000, 0xFFFF, 0xABCD] {
+            assert_eq!(dop_payload_from_f32(p as f32 / DOP_SCALE), p);
+        }
+        assert!(v.iter().all(|x| (0.0..1.0).contains(x)));
     }
 
     #[test]

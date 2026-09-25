@@ -4,9 +4,13 @@
 
 [foobar2000](https://www.foobar2000.org/)(カスタマイズ性と高音質再生で知られる無料プレーヤー)をリスペクトした、**高音質・高画質優先のプレーヤー**をRustで作るプロジェクト。PCM・DSD・Opus・WAV・MP3などの音声と、MP4・MKVなどの動画を、**自由な組み合わせ**(例: MP4動画+DSD音声)で扱い、ハードウェアが対応していればDSD/MQAをそのまま送り、対応していなければ自動でPCMに変換して再生する。
 
+## ダウンロード / Download
+
+**最新インストーラー(Windows / macOS / Linux): https://github.com/aon-co-jp/open-bar/releases/latest**
+
 ## 現状(2026-09-20、初版 = 再生エンジンの中核)
 
-**音声の再生は動きます(CLI)。** 共有モードとWASAPI排他モードのPCM再生は、実機のUSB DAC(MUSE HiFi M3Ultra)で確認しました。DoPは実装済みですが、**DoP対応DACでの実機確認はまだ**です(非対応DACだと大音量のノイズになるため、こちらでは試していません)。ASIOネイティブDSD(Steinbergライセンスが必要なSDK)、画面(UI)、動画表示は次の段階です。
+**音声の再生は動きます(CLI)。** 共有モードとWASAPI排他モードのPCM再生は、実機のUSB DAC(MUSE HiFi M3Ultra)で確認しました。DoPは、**D40 PRO(xCORE USB Audio 2.0)で、DSDファイルを聴いて確認**していただきました(「DSD → PCM変換より音が良い」との感想)。非対応DACに送ると大音量のノイズになるので、対応DACでのみ使ってください。ASIOネイティブDSD(Steinbergライセンスが必要なSDK)、画面(UI)、動画表示は次の段階です。
 
 | 機能 | 状態 |
 |---|---|
@@ -15,7 +19,7 @@
 | 再生計画: DSDネイティブ/DoP/PCM自動変換、PCMの上限内での縮小 | ✅ 単体テスト |
 | 音声出力(共有モード): cpal+高品質sincリサンプル | ✅ 実機(デバイスが実時間で消費することを確認: `open-bar play`) |
 | 音声出力(WASAPI排他、ビットパーフェクト) | ✅ 実機のUSB DACで44.1kHz/24bitを確認(`--exclusive`) |
-| DoP出力(排他モード) | ⚠ 実装済み・バイト配置は単体テスト。**DoP対応DACでの実機確認は未実施**(`--dop`) |
+| DoP出力(排他モード) | ✅ 実機のUSB DAC(D40 PRO)で聴取確認。マーカー位相は出力側で連続して付与(一時停止・シーク・音切れでも崩れない、単体テスト) |
 | ギャップレス連結・ReplayGain(`queue --rg`) | ✅ 実ファイルで隙間なし・-6dBで振幅半分を確認 |
 | 再生モード切替(A排他ビットパーフェクト/B共有+アップサンプル/E排他+アップサンプル/D DoP)+現在のモードを日英で大きく表示 | ✅ 実機で切替・経路表示を確認(DoPの音は未確認) |
 | DSDの逐次変換(全曲の変換を待たない) | ✅ DSD256で再生開始 約35秒→1.6秒 |
@@ -71,3 +75,10 @@ A **quality-first audio/video player** in Rust, in the spirit of [foobar2000](ht
 Verified with real files: WAV/FLAC/MP3/AAC/Vorbis/Opus/MKA plus audio inside MP4/MKV/WebM (1 kHz tone amplitude and duration checked per format); DSF/DSDIFF reading, DSD→PCM and DoP via `open-mqa-dsd` (real DSD256 probed/planned); playback planning (native DSD / DoP / automatic PCM fallback); MQA detection by tag. **MQA is never decoded or reimplemented** (patented, proprietary, not lossless): on an MQA-capable DAC the player only needs to pass the stream bit-perfectly (no volume/EQ/resampling) and the DAC unfolds it; otherwise it plays as ordinary PCM and says why. DST-compressed DSDIFF is refused explicitly. Opus in WebM needs ffmpeg as a fallback.
 
 Roadmap: verify DoP on hardware, UI (Tauri), video via libmpv with audio-master sync, ASIO DSD, make-disk integration.
+
+
+## 聴き比べの結果(2026-09-25、ユーザーの聴取)
+
+DSD256のファイルを聴くと、ノイズは無く、**D(DoP) > E(排他アップサンプル) > B(共有アップサンプル) > A(排他) の順に音が良い**との感想。アップサンプルは標準フィルターが最も良く、ソフト(20kHzで-12dB)は面白みに欠け、シャープは初版で音切れがあった(下記の高速化で修正)。
+
+**性能の実測(音切れの原因と対策)**: 汎用sinc補間は標準フィルターでも実時間の約1.5倍で余裕が無く、音切れ・ノイズの原因だった。整数倍のアップサンプル(44.1k→352.8kなど)をポリフェーズFIRに置き換え、標準は実時間の約10倍、シャープは約4.5倍、ソフトは約15倍になった。実時間に間に合わないフィルターは標準へ自動で切り替える。
