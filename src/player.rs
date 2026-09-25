@@ -447,17 +447,41 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
 
 // ---- 出力バックエンド ----
 
-fn build_cpal<T>(device: &cpal::Device, config: &StreamConfig, track: Arc<Track>, volume: Arc<AtomicU32>) -> Result<cpal::Stream, String>
+/// 現在再生中のトラック(なければ無音)。共有モードの出力ストリームは開きっぱなしで、ここを差し替えて曲やモードを切り替える。
+type Slot = Arc<Mutex<Option<Arc<Track>>>>;
+
+/// 開きっぱなしの共有モード出力。曲の切り替え・停止のたびにデバイスを開閉すると、DAC側でミュート解除のノイズ(プツッ)が出るため、
+/// ストリームは維持して無音を流し続ける。
+struct SharedOut {
+    _stream: cpal::Stream,
+    slot: Slot,
+    rate: u32,
+    ch: usize,
+    name: String,
+}
+
+fn build_cpal<T>(device: &cpal::Device, config: &StreamConfig, slot: Slot, ch: usize, volume: Arc<AtomicU32>) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32> + Send + 'static,
 {
-    let ch = track.out_ch;
     device
         .build_output_stream(
             config,
             move |out: &mut [T], _| {
                 let n = out.len() / ch;
                 let silent = |out: &mut [T]| out.iter_mut().for_each(|o| *o = T::from_sample(0.0));
+                // 再生中のトラックを取得(差し替え中のごく短い間は無音)
+                let track = match slot.try_lock() {
+                    Ok(g) => g.clone(),
+                    Err(_) => {
+                        silent(out);
+                        return;
+                    }
+                };
+                let Some(track) = track else {
+                    silent(out);
+                    return;
+                };
                 if track.paused.load(Ordering::Relaxed) {
                     silent(out);
                     return;
@@ -601,7 +625,7 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
 }
 
 fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume: Arc<AtomicU32>) {
-    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, stream: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
+    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, shared_out: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
     loop {
         let ended = shared.lock().unwrap().track.as_ref().is_some_and(|t| t.ended.load(Ordering::Acquire));
         let cmd = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -713,7 +737,7 @@ struct Ctx {
     filter: ResampleFilter,
     /// 同じ曲の別形式(PCM/DSD256/DSD64など)がプレイリストにあるとき、モードに合わせて自動で選ぶ。
     auto_version: bool,
-    stream: Option<cpal::Stream>,
+    shared_out: Option<SharedOut>,
     src_holder: Option<Arc<dyn Source>>,
     host: cpal::Host,
     shared: Arc<Mutex<Shared>>,
@@ -767,7 +791,10 @@ impl Ctx {
                 }
             }
         }
-        self.stream = None;
+        // 共有モードのストリームは開いたまま、再生中のトラックだけ外す(デバイスの開閉によるノイズを避ける)
+        if let Some(so) = &self.shared_out {
+            *so.slot.lock().unwrap() = None;
+        }
         let mut g = self.shared.lock().unwrap();
         if let Some(t) = g.track.take() {
             t.stop.store(true, Ordering::Relaxed);
@@ -976,32 +1003,42 @@ impl Ctx {
         if let Some((_, bits)) = exclusive_choice {
             #[cfg(windows)]
             {
+                self.shared_out = None; // 排他モードの間は共有ストリームを閉じる
                 let (t3, sh, vol) = (track.clone(), self.shared.clone(), self.volume.clone());
                 std::thread::spawn(move || exclusive_thread(t3, bits, sh, vol));
                 device_label = default_device_name();
             }
         } else if let (Some(device), Some(fmt)) = (dev, sample_format) {
-            let config = StreamConfig { channels: out_ch as u16, sample_rate: cpal::SampleRate(out_rate), buffer_size: cpal::BufferSize::Default };
-            let built = match fmt {
-                SampleFormat::F32 => build_cpal::<f32>(&device, &config, track.clone(), self.volume.clone()),
-                SampleFormat::I16 => build_cpal::<i16>(&device, &config, track.clone(), self.volume.clone()),
-                SampleFormat::I32 => build_cpal::<i32>(&device, &config, track.clone(), self.volume.clone()),
-                other => Err(format!("未対応のデバイス形式: {other:?}")),
-            };
-            match built {
-                Ok(s) => {
-                    if let Err(e) = s.play() {
+            // 既存の共有ストリームが同じデバイス・形式なら使い回し、違えば作り直す
+            let reuse = self.shared_out.as_ref().is_some_and(|so| so.rate == out_rate && so.ch == out_ch && so.name == dev_name);
+            if !reuse {
+                self.shared_out = None;
+                let slot: Slot = Arc::new(Mutex::new(None));
+                let config = StreamConfig { channels: out_ch as u16, sample_rate: cpal::SampleRate(out_rate), buffer_size: cpal::BufferSize::Default };
+                let built = match fmt {
+                    SampleFormat::F32 => build_cpal::<f32>(&device, &config, slot.clone(), out_ch, self.volume.clone()),
+                    SampleFormat::I16 => build_cpal::<i16>(&device, &config, slot.clone(), out_ch, self.volume.clone()),
+                    SampleFormat::I32 => build_cpal::<i32>(&device, &config, slot.clone(), out_ch, self.volume.clone()),
+                    other => Err(format!("未対応のデバイス形式: {other:?}")),
+                };
+                match built {
+                    Ok(stream) => {
+                        if let Err(e) = stream.play() {
+                            track.stop.store(true, Ordering::Relaxed);
+                            set_msg(&self.shared, format!("再生を開始できません: {e}"));
+                            return;
+                        }
+                        self.shared_out = Some(SharedOut { _stream: stream, slot, rate: out_rate, ch: out_ch, name: dev_name.clone() });
+                    }
+                    Err(e) => {
                         track.stop.store(true, Ordering::Relaxed);
-                        set_msg(&self.shared, format!("再生を開始できません: {e}"));
+                        set_msg(&self.shared, format!("ストリームを開けません: {e}"));
                         return;
                     }
-                    self.stream = Some(s);
                 }
-                Err(e) => {
-                    track.stop.store(true, Ordering::Relaxed);
-                    set_msg(&self.shared, format!("ストリームを開けません: {e}"));
-                    return;
-                }
+            }
+            if let Some(so) = &self.shared_out {
+                *so.slot.lock().unwrap() = Some(track.clone());
             }
         }
         self.src_holder = Some(src.clone());

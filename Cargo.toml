@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/aon-co-jp/open-bar"
 
 [workspace]
-members = ["app/src-tauri"]
+members = ["app/src-tauri", "server"]
 
 [lib]
 name = "open_bar"
