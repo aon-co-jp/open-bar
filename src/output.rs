@@ -58,14 +58,61 @@ pub enum ResampleFilter {
     Sharp,
     /// ソフト: 緩やかなロールオフ(カットオフ90%)。急峻なフィルターより時間軸のにじみ(リンギング)が短い。
     Soft,
+    /// カスタム: カットオフを原音のナイキストに対する百分率(80〜99)で指定する(256タップ)。標準(95)とソフト(90)の間を細かく試せる。
+    Custom(u8),
 }
 
 pub fn sinc_params(f: ResampleFilter) -> SincInterpolationParameters {
     match f {
         ResampleFilter::Standard => SincInterpolationParameters { sinc_len: 256, f_cutoff: 0.95, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 },
-        ResampleFilter::Sharp => SincInterpolationParameters { sinc_len: 1024, f_cutoff: 0.99, interpolation: SincInterpolationType::Cubic, oversampling_factor: 512, window: WindowFunction::BlackmanHarris2 },
+        // 1024タップ・512倍オーバーサンプルは重すぎて実時間に間に合わず、音切れの原因になった(実機の聴取で判明)ため、512タップにした
+        ResampleFilter::Sharp => SincInterpolationParameters { sinc_len: 512, f_cutoff: 0.99, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 },
+        ResampleFilter::Custom(pct) => SincInterpolationParameters { sinc_len: 256, f_cutoff: (pct.clamp(80, 99) as f32) / 100.0, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 },
         ResampleFilter::Soft => SincInterpolationParameters { sinc_len: 256, f_cutoff: 0.90, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::Blackman2 },
     }
+}
+
+/// 整数倍アップサンプル用のポリフェーズ設計(位相あたりタップ数M、元のナイキストに対するカットオフ)。フィルターの種類ごと。
+pub fn poly_design(f: ResampleFilter) -> (usize, f64) {
+    match f {
+        ResampleFilter::Standard => (128, 0.95),
+        ResampleFilter::Sharp => (256, 0.99),
+        ResampleFilter::Soft => (96, 0.90),
+        ResampleFilter::Custom(pct) => (128, pct.clamp(80, 99) as f64 / 100.0),
+    }
+}
+
+/// `from`→`to`が整数倍(2〜32倍)ならその倍率。
+pub fn integer_ratio(from: u32, to: u32) -> Option<usize> {
+    (from > 0 && to > from && to % from == 0 && (to / from) <= 32).then(|| (to / from) as usize)
+}
+
+/// このフィルターで`from`→`to`Hzの変換が、実時間の何倍の速さで進むかを実測する(1.0未満なら音切れする)。
+pub fn filter_realtime_factor(from: u32, to: u32, channels: usize, filter: ResampleFilter) -> f64 {
+    if from == to {
+        return f64::INFINITY;
+    }
+    let frames = (from as usize) / 2; // 0.5秒ぶんの擬似信号
+    let mut x = 0x2545F4914F6CDD1Du64;
+    let samples: Vec<f32> = (0..frames * channels)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ((x >> 40) as f32 / 8_388_608.0 - 1.0) * 0.3
+        })
+        .collect();
+    let t0 = std::time::Instant::now();
+    if let Some(l) = integer_ratio(from, to) {
+        let (m, cutoff) = poly_design(filter);
+        for c in 0..channels {
+            let mono: Vec<f32> = samples.iter().skip(c).step_by(channels).copied().collect();
+            let _ = crate::polyphase::Upsampler::new(l, m, cutoff, 9.0).process(&mono);
+        }
+    } else {
+        let _ = resample_with(&samples, channels, from, to, filter);
+    }
+    0.5 / t0.elapsed().as_secs_f64().max(1e-6)
 }
 
 /// インターリーブしたf32を`from`Hz→`to`Hzへ高品質変換する(標準フィルター)。
@@ -282,6 +329,7 @@ mod tests {
                 ResampleFilter::Sharp => assert!(pass20.abs() < 0.1, "シャープは20kHzまで平坦: {pass20}"),
                 ResampleFilter::Standard => assert!(pass20.abs() < 0.5, "標準も20kHzはほぼ平坦: {pass20}"),
                 ResampleFilter::Soft => assert!(pass20 < -0.5, "ソフトは20kHzを緩やかに落とす: {pass20}"),
+                ResampleFilter::Custom(_) => {}
             }
         }
     }

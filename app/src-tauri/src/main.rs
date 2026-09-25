@@ -87,6 +87,10 @@ fn player_set_filter(player: State<Player>, filter: ResampleFilter) {
     player.set_filter(filter);
 }
 #[tauri::command]
+fn player_set_auto_version(player: State<Player>, on: bool) {
+    player.set_auto_version(on);
+}
+#[tauri::command]
 fn player_set_volume(player: State<Player>, volume: f32) {
     player.set_volume(volume);
 }
@@ -99,7 +103,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Player::new())
-        .invoke_handler(tauri::generate_handler![probe_file, scan_folder, startup_files, player_set_playlist, player_play, player_pause, player_resume, player_stop, player_next, player_prev, player_seek, player_set_volume, player_status, player_modes, player_set_mode, player_set_filter])
+        .invoke_handler(tauri::generate_handler![probe_file, scan_folder, startup_files, player_set_playlist, player_play, player_pause, player_resume, player_stop, player_next, player_prev, player_seek, player_set_volume, player_status, player_modes, player_set_mode, player_set_filter, player_set_auto_version])
         .run(tauri::generate_context!())
         .expect("open-barの起動に失敗しました");
 }

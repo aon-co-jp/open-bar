@@ -291,3 +291,17 @@ fn no_underruns_in_shared_and_exclusive_upsample_playback() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 各アップサンプルフィルターが実時間の何倍の速さで変換できるか(1.0未満だと音切れ)。実測値を表示し、標準は十分速いことを確認する。
+#[test]
+fn upsample_filters_run_faster_than_real_time() {
+    use open_bar::output::{filter_realtime_factor, ResampleFilter};
+    for (name, f) in [("標準", ResampleFilter::Standard), ("シャープ", ResampleFilter::Sharp), ("ソフト", ResampleFilter::Soft), ("カスタム93%", ResampleFilter::Custom(93))] {
+        let rtf = filter_realtime_factor(44_100, 352_800, 2, f);
+        let rtf_dsd = filter_realtime_factor(176_400, 352_800, 2, f);
+        eprintln!("{name}: 44.1k→352.8k ステレオ = 実時間の {rtf:.1} 倍 / 176.4k→352.8k = {rtf_dsd:.1} 倍");
+        if matches!(f, ResampleFilter::Standard | ResampleFilter::Soft | ResampleFilter::Custom(_)) {
+            assert!(rtf > 3.0, "{name}が実時間に十分間に合わない: {rtf}");
+        }
+    }
+}

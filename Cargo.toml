@@ -39,5 +39,8 @@ serde_json = "1"
 wasapi = "0.24"
 
 # 依存クレート(rubatoのsinc補間など)はdebugビルドでも最適化する(テストが遅すぎるため)
+[profile.dev]
+opt-level = 2
+
 [profile.dev.package."*"]
 opt-level = 3

@@ -6,6 +6,27 @@
 
 use crate::output::OutputError;
 use std::sync::atomic::{AtomicBool, Ordering};
+/// 出力スレッドを「Pro Audio」(MMCSS)+最高優先度にする。Windowsが他の処理を優先して音が一瞬途切れるのを防ぐ。
+mod rt {
+    #[link(name = "avrt")]
+    extern "system" {
+        fn AvSetMmThreadCharacteristicsW(task: *const u16, index: *mut u32) -> isize;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadPriority(h: isize, p: i32) -> i32;
+    }
+    pub fn boost_current_thread() {
+        let name: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+        let mut idx = 0u32;
+        unsafe {
+            AvSetMmThreadCharacteristicsW(name.as_ptr(), &mut idx);
+            SetThreadPriority(GetCurrentThread(), 15); // THREAD_PRIORITY_TIME_CRITICAL
+        }
+    }
+}
+
 use wasapi::{initialize_mta, AudioClient, AudioRenderClient, DeviceEnumerator, Direction, Handle, SampleType, StreamMode, WaveFormat};
 
 #[derive(Debug, Clone)]
@@ -23,15 +44,7 @@ fn werr<E: std::fmt::Display>(e: E) -> OutputError {
     OutputError::Stream(e.to_string())
 }
 
-/// 24bit符号付き整数のサンプル(`i32`の下位24bit)を、デバイスのコンテナ幅(3または4バイト)へ書く。
-/// 4バイトは左詰め(`sample << 8`)、3バイトはそのままの24bit。**ビットパーフェクト**(値は一切変えない)。
-pub fn write_sample_24(out: &mut Vec<u8>, sample24: i32, container_bytes: usize) {
-    match container_bytes {
-        3 => out.extend_from_slice(&sample24.to_le_bytes()[..3]),
-        4 => out.extend_from_slice(&(sample24 << 8).to_le_bytes()),
-        _ => unreachable!("24bitデータの出力コンテナは3または4バイト"),
-    }
-}
+pub use crate::exclusive_bytes::write_sample_24;
 
 /// f32(±1.0)を`bits`ビットの整数へ丸める。ソースが16/24bit整数由来(または DoPワード)なら値は厳密に整数へ戻る。
 pub fn quantize(v: f32, bits: u32) -> i32 {
@@ -77,7 +90,9 @@ impl ExclusiveDevice {
         let block = fmt.get_blockalign() as usize;
         let container_bytes = block / channels;
         let (_def, min_period) = client.get_device_period().map_err(werr)?;
-        let period = client.calculate_aligned_period_near(3 * min_period / 2, Some(128), &fmt).map_err(werr)?;
+        // 周期は長め(最低でも約10ms)にして、Windowsのスケジューリングの揺れで音が途切れにくくする(遅延は気にしない用途)。
+        let wanted = (3 * min_period / 2).max(100_000);
+        let period = client.calculate_aligned_period_near(wanted, Some(128), &fmt).map_err(werr)?;
         client
             .initialize_client(&fmt, &Direction::Render, &StreamMode::EventsExclusive { period_hns: period })
             .map_err(|e| OutputError::Stream(format!("排他モードを開始できません(他のアプリが使用中、または排他モードが禁止されています): {e}")))?;
@@ -92,6 +107,7 @@ impl ExclusiveDevice {
     where
         F: FnMut(usize, usize, usize, &mut Vec<u8>) -> bool,
     {
+        rt::boost_current_thread();
         let block = self.container_bytes * self.channels;
         let mut written: u64 = 0;
         let mut more = true;

@@ -1,0 +1,64 @@
+# open-bar: tag(v*)をpushすると、Windows/macOS/Linux向けインストーラーをビルドしてGitHub Releasesへ公開する。
+# Publishes installers for Windows / macOS / Linux when a v* tag is pushed.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "macos-latest"
+            args: "--target aarch64-apple-darwin"
+          - platform: "macos-latest"
+            args: "--target x86_64-apple-darwin"
+          - platform: "ubuntu-22.04"
+            args: ""
+          - platform: "windows-latest"
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
+
+      - name: install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: install frontend dependencies
+        working-directory: app
+        run: npm install
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: app
+          tagName: ${{ github.ref_name }}
+          releaseName: "open-bar ${{ github.ref_name }}"
+          releaseBody: |
+            open-bar: foobar2000-inspired high-resolution audio player (PCM / DSD / DoP / exclusive mode). See README.md for status and known limitations.
+            open-bar: foobar2000をリスペクトした高音質プレーヤー(PCM/DSD/DoP/排他モード)。現状・既知の制限はREADME.mdを参照してください。
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

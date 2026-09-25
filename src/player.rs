@@ -12,7 +12,8 @@
 //!
 //! 曲の切り替わりに短い隙間(数十ms)が入る(ギャップレスは次の段階)。
 
-use crate::output::{map_channels_pub, sinc_params, ResampleFilter};
+use crate::output::{integer_ratio, map_channels_pub, poly_design, sinc_params, ResampleFilter};
+use crate::polyphase::Upsampler;
 use crate::pcm::decode_file;
 use crate::source::{DopSource, DsdPcmSource, PcmSource, Source};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -122,6 +123,7 @@ pub struct Status {
     pub underrun_frames: u64,
     /// 選択中のアップサンプルフィルター。
     pub filter: ResampleFilter,
+    pub auto_version: bool,
 }
 
 enum Cmd {
@@ -135,6 +137,7 @@ enum Cmd {
     Prev,
     SetMode(PlayMode),
     SetFilter(ResampleFilter),
+    SetAutoVersion(bool),
     Quit,
 }
 
@@ -160,6 +163,12 @@ struct Track {
     out_ch: usize,
     total_secs: f64,
     filter: ResampleFilter,
+    /// 停止・切り替えの直前に、クリックノイズを避けて音量をなめらかに0へ下げる(約20ms)。
+    fadeout: AtomicBool,
+    faded: AtomicBool,
+    fade_gain: AtomicU32,
+    /// DoPのペイロードを運んでいる(マーカーは出力スレッドが付け、音量処理は一切しない)。
+    dop: bool,
 }
 
 struct Shared {
@@ -193,6 +202,7 @@ fn blank_status(mode: PlayMode) -> Status {
         message: String::new(),
         underrun_frames: 0,
         filter: ResampleFilter::Standard,
+        auto_version: true,
     }
 }
 
@@ -237,6 +247,10 @@ impl Player {
     /// アップサンプルのフィルターを切り替える。再生中なら同じ位置から新しいフィルターで再開する。
     pub fn set_filter(&self, f: ResampleFilter) {
         let _ = self.tx.send(Cmd::SetFilter(f));
+    }
+    /// 同じ曲の別形式(例: `曲.wav`・`曲.dsd256.dsf`・`曲.dsd64.dsf`)をモードに合わせて自動選択するか(既定: する)。
+    pub fn set_auto_version(&self, on: bool) {
+        let _ = self.tx.send(Cmd::SetAutoVersion(on));
     }
     pub fn set_volume(&self, v: f32) {
         self.volume.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
@@ -286,13 +300,29 @@ fn khz(hz: u32) -> String {
 const RING_SECS: f64 = 8.0;
 /// 再生を始める前に溜める量(秒)。DoPは1フレームでも欠けるとDAC側のDSD判定が外れてノイズになるため、余裕を持たせる。
 const PRIME_SECS: f64 = 0.75;
+/// 開始・シーク直後のフェードイン、停止・切り替え直前のフェードアウトの長さ(秒)。
+const FADE_SECS: f64 = 0.02;
 const CHUNK: usize = 2048;
 
-fn make_resampler(from: u32, to: u32, ch: usize, filter: ResampleFilter) -> Option<SincFixedIn<f32>> {
+/// 変換器: 整数倍ならポリフェーズ(高速)、そうでなければ汎用のsinc補間(rubato)。
+enum Rs {
+    None,
+    Sinc(Box<SincFixedIn<f32>>),
+    Poly(Vec<Upsampler>),
+}
+
+fn make_resampler(from: u32, to: u32, ch: usize, filter: ResampleFilter) -> Rs {
     if from == to {
-        return None;
+        return Rs::None;
     }
-    SincFixedIn::<f32>::new(to as f64 / from as f64, 2.0, sinc_params(filter), CHUNK, ch).ok()
+    if let Some(l) = integer_ratio(from, to) {
+        let (m, cutoff) = poly_design(filter);
+        return Rs::Poly((0..ch).map(|_| Upsampler::new(l, m, cutoff, 9.0)).collect());
+    }
+    match SincFixedIn::<f32>::new(to as f64 / from as f64, 2.0, sinc_params(filter), CHUNK, ch) {
+        Ok(r) => Rs::Sinc(Box::new(r)),
+        Err(_) => Rs::None,
+    }
 }
 
 /// 生産スレッド: ソースを`CHUNK`フレームずつ読み→(必要なら)リサンプル→チャンネル変換→リングへ。リングが満杯なら待つ。
@@ -303,7 +333,10 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
     let mut gen_seen = track.seek_gen.load(Ordering::Acquire);
     let mut pos: u64 = 0;
     let mut rs = make_resampler(src_rate, track.out_rate, ch, track.filter);
+    let mut flushed = false;
     let capacity = (RING_SECS * track.out_rate as f64) as usize * track.out_ch;
+    let fade_frames = (FADE_SECS * track.out_rate as f64) as usize;
+    let mut fade_left = if track.dop { 0 } else { fade_frames }; // 開始・シーク直後はなめらかに立ち上げる(波形の途中から始まるとクリック音になる)
     loop {
         if track.stop.load(Ordering::Relaxed) {
             return;
@@ -313,14 +346,31 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
             gen_seen = g;
             pos = track.seek_src_frame.load(Ordering::Acquire).min(src_frames);
             rs = make_resampler(src_rate, track.out_rate, ch, track.filter);
+            flushed = false;
             track.producer_done.store(false, Ordering::Release);
             let mut ring = track.ring.lock().unwrap();
             ring.clear();
             track.consumed.store(0, Ordering::Release);
             track.primed.store(false, Ordering::Release);
+            fade_left = if track.dop { 0 } else { fade_frames };
             track.base.store((pos as f64 * track.out_rate as f64 / src_rate as f64) as u64, Ordering::Release);
         }
         if pos >= src_frames {
+            // ポリフェーズはフィルターの遅延ぶんの末尾が残っているので、最後に一度だけ吐き出す
+            if !flushed {
+                flushed = true;
+                if let Rs::Poly(ups) = &mut rs {
+                    let tails: Vec<Vec<f32>> = ups.iter_mut().map(|u| u.flush()).collect();
+                    let frames = tails.iter().map(|t| t.len()).min().unwrap_or(0);
+                    let mut inter = Vec::with_capacity(frames * ch);
+                    for i in 0..frames {
+                        for t in &tails {
+                            inter.push(t[i]);
+                        }
+                    }
+                    track.ring.lock().unwrap().extend(map_channels_pub(&inter, ch, track.out_ch));
+                }
+            }
             track.producer_done.store(true, Ordering::Release);
             std::thread::sleep(Duration::from_millis(20));
             continue;
@@ -335,9 +385,27 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
             pos = src_frames;
             continue;
         }
-        let out: Vec<f32> = match rs.as_mut() {
-            None => map_channels_pub(&block, ch, track.out_ch),
-            Some(r) => {
+        let out: Vec<f32> = match &mut rs {
+            Rs::None => map_channels_pub(&block, ch, track.out_ch),
+            Rs::Poly(ups) => {
+                let outs: Vec<Vec<f32>> = ups
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(c, u)| {
+                        let mono: Vec<f32> = block.iter().skip(c).step_by(ch).copied().collect();
+                        u.process(&mono)
+                    })
+                    .collect();
+                let frames = outs.iter().map(|o| o.len()).min().unwrap_or(0);
+                let mut inter = Vec::with_capacity(frames * ch);
+                for i in 0..frames {
+                    for o in &outs {
+                        inter.push(o[i]);
+                    }
+                }
+                map_channels_pub(&inter, ch, track.out_ch)
+            }
+            Rs::Sinc(r) => {
                 let planar: Vec<Vec<f32>> = (0..ch).map(|c| block.iter().skip(c).step_by(ch).copied().collect()).collect();
                 let refs: Vec<&[f32]> = planar.iter().map(|v| v.as_slice()).collect();
                 let res = if n == CHUNK { r.process(&refs, None) } else { r.process_partial(Some(&refs), None) };
@@ -360,6 +428,18 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
         // シークが入っていたら、この塊は古い位置のものなので捨てる
         if track.seek_gen.load(Ordering::Acquire) != gen_seen {
             continue;
+        }
+        let mut out = out;
+        if fade_left > 0 {
+            let ch_out = track.out_ch;
+            let frames = out.len() / ch_out;
+            for f in 0..frames.min(fade_left) {
+                let g = 1.0 - (fade_left - f) as f32 / fade_frames as f32;
+                for c in 0..ch_out {
+                    out[f * ch_out + c] *= g;
+                }
+            }
+            fade_left = fade_left.saturating_sub(frames);
         }
         track.ring.lock().unwrap().extend(out);
     }
@@ -397,9 +477,19 @@ where
                     }
                 }
                 let take = n.min(avail);
-                for f in 0..take {
-                    for c in 0..ch {
-                        out[f * ch + c] = T::from_sample(ring.pop_front().unwrap_or(0.0) * vol);
+                let fading = track.fadeout.load(Ordering::Relaxed);
+                let step = 1.0 / (FADE_SECS * track.out_rate as f64) as f32;
+                let mut gain = f32::from_bits(track.fade_gain.load(Ordering::Relaxed));
+                for (i, (o, v)) in out.iter_mut().zip(ring.drain(..take * ch)).enumerate() {
+                    if fading && i % ch == 0 && gain > 0.0 {
+                        gain = (gain - step).max(0.0);
+                    }
+                    *o = T::from_sample(v * vol * gain);
+                }
+                if fading {
+                    track.fade_gain.store(gain.to_bits(), Ordering::Relaxed);
+                    if gain <= 0.0 {
+                        track.faded.store(true, Ordering::Release);
                     }
                 }
                 for o in out[take * ch..].iter_mut() {
@@ -420,10 +510,28 @@ where
         .map_err(|e| e.to_string())
 }
 
-/// 排他モードの出力スレッド: リングからフレームを取り、整数(16/24bit)へ変換してWASAPIへ書く。音量処理はしない。
+/// DoPの出力バイト列を作る(純粋関数。排他スレッドから使い、単体テストできる)。`next_payload`が尽きたら(`None`)DSD無音で埋める。
+/// マーカーは`marker_even`から始めて**1フレームごとに反転**し、呼び出しをまたいでも位相が連続する。
+pub fn dop_fill(marker_even: &mut bool, mut next_payload: impl FnMut() -> Option<u16>, frames: usize, channels: usize, container_bytes: usize, out: &mut Vec<u8>) {
+    use crate::source::{dop_word, DOP_IDLE_PAYLOAD};
+    for _ in 0..frames {
+        for _ in 0..channels {
+            let payload = next_payload().unwrap_or(DOP_IDLE_PAYLOAD);
+            crate::exclusive_bytes::write_sample_24(out, dop_word(*marker_even, payload), container_bytes);
+        }
+        *marker_even = !*marker_even;
+    }
+}
+
+/// 排他モードの出力スレッド: リングからフレームを取り、整数(16/24bit)へ変換してWASAPIへ書く。
+/// - PCM: 音量が100%ならビットパーフェクト。100%未満のときだけデジタルで下げる(聴き比べの音量合わせ用)。
+/// - DoP: リングにはペイロード(DSD 2バイト)が載っており、**ここで連続した位相のマーカー(0x05/0xFA交互)を付ける**。
+///   一時停止・シーク・音切れ・開始前の隙間は、DSD無音(0x69)のペイロードで埋めて位相を保つ(0のPCMを混ぜるとDACが
+///   DSDの判定を外してノイズになる)。DoPでは音量処理を一切しない。
 #[cfg(windows)]
 fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, volume: Arc<AtomicU32>) {
     use crate::exclusive::{quantize, write_sample_24, ExclusiveDevice};
+    use crate::source::dop_payload_from_f32;
     let dev = match ExclusiveDevice::open(track.out_rate, track.out_ch, bits) {
         Ok(d) => d,
         Err(e) => {
@@ -433,31 +541,47 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
         }
     };
     let ch = track.out_ch;
+    let mut marker_even = true; // DoPのマーカー位相(全チャンネル共通、フレームごとに反転)
     let r = dev.run(&track.stop, |n, cbytes, chn, out| {
         let paused = track.paused.load(Ordering::Relaxed);
-        let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+        let vol = if track.dop { 1.0 } else { f32::from_bits(volume.load(Ordering::Relaxed)) };
+        let fading = track.fadeout.load(Ordering::Relaxed) && !track.dop;
+        let step = 1.0 / (FADE_SECS * track.out_rate as f64) as f32;
+        let mut gain = f32::from_bits(track.fade_gain.load(Ordering::Relaxed));
         let mut ring = track.ring.lock().unwrap();
         let ring_frames = ring.len() / ch;
-        if !paused && !track.primed.load(Ordering::Acquire) {
-            if ring_frames as f64 >= PRIME_SECS * track.out_rate as f64 || track.producer_done.load(Ordering::Acquire) {
-                track.primed.store(true, Ordering::Release);
-            }
+        if !paused && !track.primed.load(Ordering::Acquire) && (ring_frames as f64 >= PRIME_SECS * track.out_rate as f64 || track.producer_done.load(Ordering::Acquire)) {
+            track.primed.store(true, Ordering::Release);
         }
-        // 先読みが溜まるまでは無音(DoPでも、開始前の無音はマーカー無しのPCM無音で問題ない)
+        // 先読みが溜まるまでは無音(DoPはDSD無音で位相を保つ)
         let avail = if paused || !track.primed.load(Ordering::Acquire) { 0 } else { ring_frames };
         let take = n.min(avail);
+        let mut samples = ring.drain(..take * ch);
         for f in 0..n {
-            for _c in 0..chn {
-                // 音量が100%ならビットパーフェクト(値を一切変えない)。100%未満のときだけデジタルで下げる(聴き比べの音量合わせ用)。
-                let v = if f < take { ring.pop_front().unwrap_or(0.0) * vol } else { 0.0 };
-                let s = quantize(v, bits as u32);
-                if bits == 16 && cbytes == 2 {
-                    out.extend_from_slice(&(s as i16).to_le_bytes());
-                } else if bits == 16 {
-                    write_sample_24(out, s << 8, cbytes);
-                } else {
-                    write_sample_24(out, s, cbytes);
+            if track.dop {
+                dop_fill(&mut marker_even, || if f < take { samples.next().map(dop_payload_from_f32) } else { None }, 1, chn, cbytes, out);
+            } else {
+                for _c in 0..chn {
+                    if fading && _c == 0 && gain > 0.0 {
+                        gain = (gain - step).max(0.0);
+                    }
+                    let v = if f < take { samples.next().unwrap_or(0.0) * vol * gain } else { 0.0 };
+                    let s = quantize(v, bits as u32);
+                    if bits == 16 && cbytes == 2 {
+                        out.extend_from_slice(&(s as i16).to_le_bytes());
+                    } else if bits == 16 {
+                        write_sample_24(out, s << 8, cbytes);
+                    } else {
+                        write_sample_24(out, s, cbytes);
+                    }
                 }
+            }
+        }
+        drop(samples);
+        if fading {
+            track.fade_gain.store(gain.to_bits(), Ordering::Relaxed);
+            if gain <= 0.0 {
+                track.faded.store(true, Ordering::Release);
             }
         }
         track.consumed.fetch_add(take as u64, Ordering::Relaxed);
@@ -477,7 +601,7 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
 }
 
 fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume: Arc<AtomicU32>) {
-    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, stream: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
+    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, stream: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
     loop {
         let ended = shared.lock().unwrap().track.as_ref().is_some_and(|t| t.ended.load(Ordering::Acquire));
         let cmd = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -540,6 +664,10 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume
                     ctx.start_track(i, 0.0);
                 }
             }
+            Cmd::SetAutoVersion(on) => {
+                ctx.auto_version = on;
+                shared.lock().unwrap().status.auto_version = on;
+            }
             Cmd::SetFilter(f) => {
                 ctx.filter = f;
                 let (playing, pos) = {
@@ -583,11 +711,33 @@ struct Ctx {
     current: Option<usize>,
     mode: PlayMode,
     filter: ResampleFilter,
+    /// 同じ曲の別形式(PCM/DSD256/DSD64など)がプレイリストにあるとき、モードに合わせて自動で選ぶ。
+    auto_version: bool,
     stream: Option<cpal::Stream>,
     src_holder: Option<Arc<dyn Source>>,
     host: cpal::Host,
     shared: Arc<Mutex<Shared>>,
     volume: Arc<AtomicU32>,
+}
+
+/// 「同じ曲」の名前(最初の`.`より前、大文字小文字は区別しない)。`Track04.wav`・`Track04.dsd256.dsf`・`track04.dsd64.dsf`は同じ曲。
+pub fn version_stem(path: &str) -> String {
+    let name = path.replace('\\', "/").rsplit('/').next().unwrap_or(path).to_string();
+    name.split('.').next().unwrap_or(&name).to_lowercase()
+}
+
+/// 同じ曲の候補の中から、モードに合う形式を選ぶ(純粋関数)。`candidates`は(プレイリスト位置, DSDか, ビットレート/サンプルレート)。
+/// - DoP(D): DSDのうち、`dop_ok`(DoPのPCMレート=DSDレート/16を機器が受け付けるか)を満たすもの。レートが高い順(DSD256 → DSD64)。
+///   受けられるDSDが無ければ`None`(呼び出し側がPCMへ落とす)。
+/// - A/B/E: PCM版(あれば)。無ければ`None`(=そのDSDをPCM化して再生)。PCMが複数なら先頭。
+pub fn pick_version(mode: PlayMode, candidates: &[(usize, bool, u32)], dop_ok: &dyn Fn(u32) -> bool) -> Option<usize> {
+    if mode == PlayMode::Dop {
+        let mut dsd: Vec<&(usize, bool, u32)> = candidates.iter().filter(|c| c.1).collect();
+        dsd.sort_by(|a, b| b.2.cmp(&a.2));
+        dsd.into_iter().find(|c| dop_ok(c.2)).map(|c| c.0)
+    } else {
+        candidates.iter().find(|c| !c.1).map(|c| c.0)
+    }
 }
 
 /// 排他モードで使うPCMのレート候補(元レートと同じ系列、高い順)。`upsample`なら352.8k/384kまで上げる。
@@ -606,6 +756,17 @@ fn exclusive_rates(src_rate: u32, upsample: bool) -> Vec<u32> {
 
 impl Ctx {
     fn stop_track(&mut self) {
+        // クリック音を避けるため、まず約20msかけて音量を0へ下げてから止める(DoPは音量処理できないので即停止)
+        let t = self.shared.lock().unwrap().track.clone();
+        if let Some(t) = t {
+            if !t.dop && !t.paused.load(Ordering::Relaxed) && t.primed.load(Ordering::Acquire) {
+                t.fadeout.store(true, Ordering::Release);
+                let t0 = std::time::Instant::now();
+                while !t.faded.load(Ordering::Acquire) && t0.elapsed() < Duration::from_millis(120) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
         self.stream = None;
         let mut g = self.shared.lock().unwrap();
         if let Some(t) = g.track.take() {
@@ -643,9 +804,48 @@ impl Ctx {
         Ok(Arc::new(PcmSource::new(pcm, kind)))
     }
 
+    /// 自動選択(`auto_version`)が有効なら、同じ曲の別形式のうちモードに合うものへ切り替える。(選んだ位置, 説明)を返す。
+    fn resolve_version(&self, i: usize) -> (usize, String) {
+        if !self.auto_version {
+            return (i, String::new());
+        }
+        let stem = version_stem(&self.playlist[i]);
+        let mut cands: Vec<(usize, bool, u32)> = Vec::new();
+        for (idx, p) in self.playlist.iter().enumerate() {
+            if version_stem(p) != stem {
+                continue;
+            }
+            let info = crate::media::probe(p);
+            let is_dsd = info.kind == crate::media::MediaKind::Dsd;
+            cands.push((idx, is_dsd, info.sample_rate_hz.unwrap_or(0)));
+        }
+        if cands.len() < 2 {
+            return (i, String::new());
+        }
+        #[cfg(windows)]
+        let dop_ok = |dsd_rate: u32| crate::exclusive::probe(dsd_rate / 16, 2, 24).is_ok();
+        #[cfg(not(windows))]
+        let dop_ok = |_: u32| false;
+        match pick_version(self.mode, &cands, &dop_ok) {
+            Some(j) if j != i => {
+                let c = cands.iter().find(|c| c.0 == j).copied().unwrap_or((j, false, 0));
+                let what = if c.1 { format!("DSD{}", c.2 / 44_100) } else { format!("PCM {}", khz(c.2)) };
+                (j, format!("モードに合わせて同じ曲の「{what}」版を自動で選びました。 / Auto-picked the {what} version of this track to match the mode."))
+            }
+            Some(j) => (j, String::new()),
+            None => {
+                // DoPで送れるDSDが無い(またはPCM版が無い): 選んだ位置のまま(DoP不可なら後段でPCM化にフォールバック)
+                let msg = if self.mode == PlayMode::Dop { "この機器がDoPで受けられるDSD版が見つからないため、選んだファイルをPCM化して再生します。 / No DSD version this DAC accepts via DoP; playing the chosen file converted to PCM.".to_string() } else { String::new() };
+                (i, msg)
+            }
+        }
+    }
+
     fn start_track(&mut self, i: usize, start_secs: f64) {
         self.stop_track();
         self.shared.lock().unwrap().status.state = PlayState::Stopped;
+        let (i, auto_note) = self.resolve_version(i);
+        self.current = Some(i);
         let path = self.playlist[i].clone();
         set_msg(&self.shared, "読み込み中... / Loading...");
         let is_dsd = crate::media::probe(&path).kind == crate::media::MediaKind::Dsd;
@@ -660,7 +860,7 @@ impl Ctx {
             }
         };
         let mut mode = self.mode;
-        let mut note = String::new();
+        let mut note = auto_note;
         // 排他系のモード: 実際に開ける形式を探す。開けなければ理由を記録して共有モードへ落とす。
         let mut exclusive_choice: Option<(u32, u16)> = None; // (レート, 有効ビット)
         #[cfg(windows)]
@@ -733,6 +933,17 @@ impl Ctx {
             };
             (default.sample_rate().0, default.channels() as usize, device.name().unwrap_or_default(), Some(default.sample_format()), Some(device))
         };
+        // 変換が実時間に間に合わないフィルター(重いシャープなど)は、音切れの原因になるので標準へ落とす。
+        let mut effective_filter = self.filter;
+        if src.rate_hz() != out_rate {
+            let rtf = crate::output::filter_realtime_factor(src.rate_hz(), out_rate, src.channels(), effective_filter);
+            if rtf < 3.0 && effective_filter != ResampleFilter::Standard {
+                let std_rtf = crate::output::filter_realtime_factor(src.rate_hz(), out_rate, src.channels(), ResampleFilter::Standard);
+                note.push_str(&format!(" このPCでは選んだフィルターが実時間に間に合わない(実時間の{rtf:.1}倍)ため、標準フィルターで再生します。 / The chosen filter is too heavy for this PC ({rtf:.1}x real time); using Standard."));
+                let _ = std_rtf;
+                effective_filter = ResampleFilter::Standard;
+            }
+        }
         let track = Arc::new(Track {
             ring: Mutex::new(VecDeque::new()),
             paused: AtomicBool::new(false),
@@ -748,7 +959,11 @@ impl Ctx {
             out_rate,
             out_ch,
             total_secs: src.duration_secs(),
-            filter: self.filter,
+            filter: effective_filter,
+            fadeout: AtomicBool::new(false),
+            faded: AtomicBool::new(false),
+            fade_gain: AtomicU32::new(1.0f32.to_bits()),
+            dop: src.kind() == "DoP",
         });
         if start_secs > 0.0 {
             let frame = ((start_secs * src.rate_hz() as f64) as u64).min(src.total_frames().saturating_sub(1));
@@ -849,5 +1064,51 @@ mod tests {
         assert_eq!(exclusive_rates(44_100, true), vec![352_800, 176_400, 88_200, 44_100]);
         assert_eq!(exclusive_rates(48_000, true), vec![384_000, 192_000, 96_000, 48_000]);
         assert_eq!(exclusive_rates(96_000, true), vec![384_000, 192_000, 96_000], "元レートと同じ値は重複しない");
+    }
+
+    #[test]
+    fn dop_markers_stay_continuous_across_data_gaps_and_calls() {
+        let mut phase = true;
+        let mut out = Vec::new();
+        // 3フレームぶんのデータ(2ch)→ その後データが尽きて2フレームは無音で埋める → 次の呼び出しでも位相が続く
+        let data = [0x1111u16, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666];
+        let mut it = data.iter().copied();
+        dop_fill(&mut phase, || it.next(), 5, 2, 4, &mut out);
+        let mut out2 = Vec::new();
+        dop_fill(&mut phase, || None, 2, 2, 4, &mut out2);
+        out.extend(out2);
+        // 4バイト/サンプル(左詰め24bit): [0, 下位, 上位, マーカー]。フレームごとに0x05,0xFA,0x05,…
+        let markers: Vec<u8> = out.chunks(4).map(|w| w[3]).collect();
+        let per_frame: Vec<u8> = markers.chunks(2).map(|f| f[0]).collect();
+        assert_eq!(per_frame, vec![0x05, 0xFA, 0x05, 0xFA, 0x05, 0xFA, 0x05], "7フレーム通して交互(呼び出しをまたいでも崩れない)");
+        assert!(markers.chunks(2).all(|f| f[0] == f[1]), "左右のマーカーは同じ位相");
+        // データ部: 先頭は0x1111、尽きた後はDSD無音0x6969
+        assert_eq!(&out[..4], &[0x00, 0x11, 0x11, 0x05]);
+        let last = &out[out.len() - 4..];
+        assert_eq!(last, &[0x00, 0x69, 0x69, 0x05], "7フレーム目(偶数位相)のマーカーは0x05");
+    }
+
+    #[test]
+    fn version_stems_group_the_same_track_across_formats() {
+        assert_eq!(version_stem("F:/a/Track04.wav"), "track04");
+        assert_eq!(version_stem("C:\\x\\track04.dsd256.dsf"), "track04");
+        assert_eq!(version_stem("Track04.dsd64.dsf"), "track04");
+        assert_ne!(version_stem("Track05.wav"), version_stem("Track04.wav"));
+    }
+
+    #[test]
+    fn mode_picks_pcm_or_the_best_dop_capable_dsd_version() {
+        // (位置, DSDか, レート): 0=PCM 44.1k、1=DSD256、2=DSD64
+        let c = [(0usize, false, 44_100u32), (1, true, 11_289_600), (2, true, 2_822_400)];
+        let all_ok = |_: u32| true;
+        let only64 = |r: u32| r == 2_822_400;
+        let none = |_: u32| false;
+        for m in [PlayMode::Exclusive, PlayMode::Shared, PlayMode::ExclusiveUpsample] {
+            assert_eq!(pick_version(m, &c, &all_ok), Some(0), "A/B/EはPCM版");
+        }
+        assert_eq!(pick_version(PlayMode::Dop, &c, &all_ok), Some(1), "DoPはまずDSD256");
+        assert_eq!(pick_version(PlayMode::Dop, &c, &only64), Some(2), "DSD256を受けられない機器ではDSD64へ自動で切り替わる");
+        assert_eq!(pick_version(PlayMode::Dop, &c, &none), None, "DoPで受けられるDSDが無ければ選ばない");
+        assert_eq!(pick_version(PlayMode::Exclusive, &c[1..], &all_ok), None, "PCM版が無ければ選ばない(DSDをPCM化)");
     }
 }

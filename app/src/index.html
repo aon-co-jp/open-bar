@@ -36,7 +36,15 @@
     <section class="filterbar">
       <span class="filter-label">アップサンプル・フィルター / Upsampling filter:</span>
       <span id="filter-buttons"></span>
+      <span class="filter-label">カットオフ / Cutoff:</span>
+      <input id="cutoff" type="range" min="85" max="99" value="95" title="標準=95、ソフト=90。細かく試せます / Standard = 95, Soft = 90" />
+      <span id="cutoff-val">95%</span>
       <span id="filter-desc" class="filter-desc"></span>
+    </section>
+    <section class="filterbar">
+      <label><input type="checkbox" id="auto-version" checked /> 同じ曲の別形式(PCM/DSD256/DSD64…)をモードに合わせて自動選択 / Auto-pick the version (PCM / DSD256 / DSD64…) of the same track to match the mode</label>
+      <span class="filter-desc">例: <code>曲.wav</code> <code>曲.dsd256.dsf</code> <code>曲.dsd64.dsf</code>(名前の最初の「.」より前が同じなら同じ曲) / same name before the first "." = same track</span>
+      <span id="underrun" class="filter-desc"></span>
     </section>
 
     <div class="actions">
