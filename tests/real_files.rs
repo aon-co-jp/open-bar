@@ -175,3 +175,86 @@ fn interactive_player_plays_pauses_seeks_and_stops_on_the_real_device() {
     wait(&|s| s.state == open_bar::player::PlayState::Stopped, 3.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 再生モード(排他・共有・排他アップサンプル)を実デバイスで切り替える。音は小さいテスト音(-34dBFSの1kHz)。
+#[test]
+fn playback_modes_switch_on_the_real_device_and_report_what_they_do() {
+    use open_bar::player::{PlayMode, PlayState, Player};
+    if !ffmpeg_ok() || cpal::traits::HostTrait::default_output_device(&cpal::default_host()).is_none() {
+        return;
+    }
+    let dir = tmpdir("modes");
+    let path = dir.join("quiet.flac");
+    let out = Command::new("ffmpeg").args(["-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=44100:duration=6", "-af", "volume=0.16", "-ac", "2", "-c:a", "flac", path.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success());
+    let p = Player::new();
+    p.set_playlist(vec![path.to_string_lossy().to_string()]);
+    let wait = |cond: &dyn Fn(&open_bar::player::Status) -> bool, secs: f64| {
+        let t0 = std::time::Instant::now();
+        loop {
+            let s = p.status();
+            if cond(&s) {
+                return s;
+            }
+            assert!(t0.elapsed().as_secs_f64() < secs, "タイムアウト: {s:?}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    // A: 排他(元の44.1kHzのまま)
+    p.set_mode(PlayMode::Exclusive);
+    p.play(0);
+    let a = wait(&|s| s.state == PlayState::Playing && s.position_secs > 0.5, 15.0);
+    eprintln!("A: {} / {} / out={}Hz / {}", a.active_mode.title_ja, a.route_ja, a.out_rate_hz, a.note);
+    if a.active_mode.id == "exclusive" {
+        assert_eq!(a.out_rate_hz, 44_100, "排他は元のレートのまま");
+        assert!(a.active_mode.bit_perfect);
+    } else {
+        eprintln!("(この機器は排他44.1kHzを開けず共有へ落ちた: {})", a.note);
+    }
+    // 再生中にBへ切り替え: 同じ位置付近から再開する
+    let pos_before = p.status().position_secs;
+    p.set_mode(PlayMode::Shared);
+    let b = wait(&|s| s.state == PlayState::Playing && s.active_mode.id == "shared" && s.position_secs >= pos_before - 0.3, 15.0);
+    eprintln!("B: {} / {} / out={}Hz", b.active_mode.title_ja, b.route_ja, b.out_rate_hz);
+    assert!(!b.active_mode.bit_perfect);
+    assert!(b.position_secs >= pos_before - 0.3 && b.position_secs < pos_before + 3.0, "切り替え後も同じ位置付近: {pos_before} → {}", b.position_secs);
+    // E: 排他アップサンプル
+    p.set_mode(PlayMode::ExclusiveUpsample);
+    let e = wait(&|s| s.state == PlayState::Playing && (s.active_mode.id != "shared" || !s.note.is_empty()) && s.position_secs > 0.1, 15.0);
+    eprintln!("E: {} / {} / out={}Hz / {}", e.active_mode.title_ja, e.route_ja, e.out_rate_hz, e.note);
+    if e.active_mode.id == "exclusive_upsample" {
+        assert!(e.out_rate_hz > 44_100 && e.out_rate_hz % 44_100 == 0, "44.1k系のまま高いレートへ: {}", e.out_rate_hz);
+    }
+    p.stop();
+    wait(&|s| s.state == PlayState::Stopped, 5.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// DSDは全曲の変換を待たず、約数秒で再生が始まる(逐次変換)。DoPは非対応機器で危険なのでここでは試さない。
+#[test]
+fn dsd_playback_starts_quickly_thanks_to_progressive_conversion() {
+    use open_bar::player::{PlayMode, PlayState, Player};
+    let path = "F:/tmp/cd_dsd/Track04.dsf";
+    if !std::path::Path::new(path).exists() || cpal::traits::HostTrait::default_output_device(&cpal::default_host()).is_none() {
+        return;
+    }
+    let p = Player::new();
+    p.set_volume(0.05);
+    p.set_mode(PlayMode::Shared);
+    p.set_playlist(vec![path.to_string()]);
+    let t0 = std::time::Instant::now();
+    p.play(0);
+    let s = loop {
+        let s = p.status();
+        if s.state == PlayState::Playing && s.position_secs > 0.3 {
+            break s;
+        }
+        assert!(t0.elapsed().as_secs_f64() < 30.0, "DSD256の再生開始が遅すぎる: {s:?}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let start = t0.elapsed().as_secs_f64();
+    eprintln!("DSD256の再生開始まで {start:.1} 秒 / {} / {}", s.source_kind, s.route_ja);
+    assert_eq!(s.source_kind, "DSD→PCM");
+    assert!(start < 8.0, "逐次変換なら全曲変換(約35秒)より大幅に速いはず: {start}");
+    p.stop();
+}

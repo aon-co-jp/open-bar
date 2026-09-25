@@ -19,8 +19,19 @@
         <input id="seek" type="range" min="0" max="1000" value="0" />
         <span id="dur-label">0:00</span>
       </div>
-      <label class="vol" title="音量 / Volume">🔊 <input id="volume" type="range" min="0" max="100" value="80" /></label>
+      <label class="vol" title="音量 / Volume">🔊 <input id="volume" type="range" min="0" max="100" value="100" /></label>
     </header>
+
+    <section class="modebar">
+      <div class="mode-buttons" id="mode-buttons"></div>
+      <div id="mode-banner" class="mode-banner">
+        <div class="mode-title-ja" id="mode-title-ja">再生モード / Playback mode</div>
+        <div class="mode-title-en" id="mode-title-en">Pick a mode, then play. You can switch during playback (same position) to compare.</div>
+        <div class="mode-route" id="mode-route"></div>
+        <div class="mode-desc" id="mode-desc"></div>
+        <div class="mode-note" id="mode-note"></div>
+      </div>
+    </section>
 
     <div class="actions">
       <button id="add-files-btn">ファイルを追加… / Add files…</button>
