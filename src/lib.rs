@@ -20,4 +20,5 @@ pub mod pcm;
 pub mod plan;
 pub mod player;
 pub mod playlist;
+pub mod source;
 pub use open_mqa_dsd as dsd;

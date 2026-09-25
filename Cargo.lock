@@ -2466,7 +2466,7 @@ dependencies = [
 [[package]]
 name = "open-mqa-dsd"
 version = "0.1.0"
-source = "git+https://github.com/aon-co-jp/open-mqa-dsd?rev=ce94b46#ce94b46e2e2f915e80d88a058b607ede511dff29"
+source = "git+https://github.com/aon-co-jp/open-mqa-dsd?rev=d885908#d8859089ced6266c0480bd2d2a7375e87bc19a3d"
 dependencies = [
  "open-mqa",
  "thiserror 1.0.69",

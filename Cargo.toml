@@ -18,13 +18,13 @@ name = "open-bar"
 path = "src/main.rs"
 
 [dependencies]
-# 荳ｻ隕√↑髻ｳ螢ｰ繝輔か繝ｼ繝槭ャ繝医・繝・さ繝ｼ繝峨・繝・・繝ｫ繝√・繝ｬ繧ｯ繧ｹ(邏燃ust)縲・KV/MP4縺ｮ髻ｳ螢ｰ繝医Λ繝・け繧りｪｭ繧√ｋ縲・
+# 主要な音声フォーマットのデコード・デマルチプレクス(純Rust)。MKV/MP4の音声トラックも読める。
 symphonia = { version = "0.5", features = ["all"] }
-# DoP(DSD over PCM)繝代ャ繧ｭ繝ｳ繧ｰ縺ｨ邏燃ust Opus繝・さ繝ｼ繝・閾ｪ繝ｪ繝昴ず繝医Μ鄒､縺ｮ open-mqa)縲・
+# DoP(DSD over PCM)パッキングと純Rust Opusデコード(open-mqa)。
 open-mqa = { git = "https://github.com/aon-co-jp/open-mqa", rev = "2d94ada", default-features = false, features = ["opus"] }
-# DSD(DSF/DSDIFF)隱ｭ縺ｿ霎ｼ縺ｿ繝ｻDSD竊単CM繝ｻDoP(open-mqa-dsd)縲・
-open-mqa-dsd = { git = "https://github.com/aon-co-jp/open-mqa-dsd", rev = "ce94b46" }
-# CPU蜻ｽ莉､繧ｻ繝・ヨ讀懷・(DSD竊単CM螟画鋤縺ｮ鬮倬溘き繝ｼ繝阪Ν驕ｸ謚槭↓菴ｿ縺・∥on-co-jp蜈ｱ騾・縲・
+# DSD(DSF/DSDIFF)読み込み・DSD→PCM・DoP(open-mqa-dsd)。
+open-mqa-dsd = { git = "https://github.com/aon-co-jp/open-mqa-dsd", rev = "d885908" }
+# CPU命令セット検出(DSD→PCM変換の高速カーネル選択に使う予定、aon-co-jp共通)。
 open-cpu = { git = "https://github.com/aon-co-jp/open-cpu" }
 # 音声出力(共有モード)と高品質リサンプル。`[target.windows]`のwasapiは排他モード用。
 cpal = "0.15"

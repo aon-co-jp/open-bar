@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use open_bar::media::{self, MediaInfo};
-use open_bar::player::{Player, Status};
+use open_bar::player::{mode_text, ModeText, PlayMode, Player, Status};
 use tauri::State;
 
 #[tauri::command]
@@ -72,6 +72,15 @@ fn player_prev(player: State<Player>) {
 fn player_seek(player: State<Player>, secs: f64) {
     player.seek(secs);
 }
+/// 再生モード(A/B/E/D)の一覧と、日英の説明文。
+#[tauri::command]
+fn player_modes() -> Vec<ModeText> {
+    [PlayMode::Exclusive, PlayMode::Shared, PlayMode::ExclusiveUpsample, PlayMode::Dop].into_iter().map(mode_text).collect()
+}
+#[tauri::command]
+fn player_set_mode(player: State<Player>, mode: PlayMode) {
+    player.set_mode(mode);
+}
 #[tauri::command]
 fn player_set_volume(player: State<Player>, volume: f32) {
     player.set_volume(volume);
@@ -85,7 +94,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Player::new())
-        .invoke_handler(tauri::generate_handler![probe_file, scan_folder, startup_files, player_set_playlist, player_play, player_pause, player_resume, player_stop, player_next, player_prev, player_seek, player_set_volume, player_status])
+        .invoke_handler(tauri::generate_handler![probe_file, scan_folder, startup_files, player_set_playlist, player_play, player_pause, player_resume, player_stop, player_next, player_prev, player_seek, player_set_volume, player_status, player_modes, player_set_mode])
         .run(tauri::generate_context!())
         .expect("open-barの起動に失敗しました");
 }

@@ -131,11 +131,37 @@ seekEl.addEventListener("change", async () => {
   dragging = false;
 });
 
-function routeText(st) {
-  if (st.state === "stopped" && !st.device) return "";
-  const src = st.source_kind === "DSD→PCM" ? `DSD→PCM変換 / DSD→PCM` : st.source_kind;
-  const conv = st.source_rate_hz && st.device_rate_hz && st.source_rate_hz !== st.device_rate_hz ? ` → ${st.device_rate_hz / 1000} kHz へ変換 / resampled` : "";
-  return `${src} ${st.source_rate_hz ? st.source_rate_hz / 1000 + " kHz" : ""}${conv} | ${st.device} (共有モード / shared)`;
+// ---- 再生モード(A/B/E/D)の選択と、再生中の大きな表示 ----
+let modes = [];
+async function initModes() {
+  modes = await invoke("player_modes");
+  const box = $("mode-buttons");
+  box.innerHTML = "";
+  for (const m of modes) {
+    const b = document.createElement("button");
+    b.dataset.mode = m.id;
+    b.title = `${m.desc_ja}
+${m.desc_en}`;
+    b.innerHTML = `<span class="l">${m.letter}: ${esc(m.title_ja)}</span><span class="e">${esc(m.title_en)}</span>`;
+    b.addEventListener("click", () => invoke("player_set_mode", { mode: m.id }));
+    box.appendChild(b);
+  }
+}
+
+function renderBanner(st) {
+  const a = st.active_mode;
+  const playing = st.state !== "stopped";
+  document.querySelectorAll("#mode-buttons button").forEach((b) => b.classList.toggle("selected", b.dataset.mode === st.selected_mode));
+  const banner = $("mode-banner");
+  banner.classList.toggle("bitperfect", !!a.bit_perfect);
+  banner.classList.toggle("shared", !a.bit_perfect);
+  $("mode-title-ja").textContent = `${a.letter}  ${a.title_ja}` + (playing ? "" : "(選択中 / selected)");
+  $("mode-title-en").textContent = a.title_en;
+  $("mode-route").textContent = playing ? `${st.route_ja}  /  ${st.route_en}` : "";
+  const vol100 = Math.round(st.volume * 100) >= 100;
+  const volNote = playing && a.bit_perfect && !vol100 ? "音量が100%未満のため、デジタルで音量処理をしています(ビットパーフェクトではありません)。/ Volume is below 100%, so digital volume is applied (not bit-perfect)." : "";
+  $("mode-note").textContent = [st.note, volNote].filter(Boolean).join("  ");
+  $("mode-desc").textContent = `${a.desc_ja}  ${a.desc_en}`;
 }
 
 async function poll() {
@@ -146,7 +172,8 @@ async function poll() {
     $("play-btn").textContent = st.state === "playing" ? "⏸" : "▶";
     const name = st.path ? baseName(st.path) : "";
     $("status-main").textContent = st.state === "playing" ? `再生中 / Playing: ${name}` : st.state === "paused" ? `一時停止 / Paused: ${name}` : "停止 / Stopped";
-    $("status-route").textContent = routeText(st);
+    renderBanner(st);
+    $("status-route").textContent = st.device ? `${st.device}` : "";
     $("status-msg").textContent = st.message || "";
     $("pos-label").textContent = fmtTime(st.position_secs);
     $("dur-label").textContent = fmtTime(st.duration_secs);
@@ -164,6 +191,7 @@ async function poll() {
 }
 setInterval(poll, 250);
 render();
+initModes();
 
 // 起動時にコマンドライン引数のファイルがあれば、追加して先頭から再生する。
 (async () => {
