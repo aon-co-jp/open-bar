@@ -143,25 +143,63 @@ async function initModes() {
     b.title = `${m.desc_ja}
 ${m.desc_en}`;
     b.innerHTML = `<span class="l">${m.letter}: ${esc(m.title_ja)}</span><span class="e">${esc(m.title_en)}</span>`;
-    b.addEventListener("click", () => invoke("player_set_mode", { mode: m.id }));
+    b.addEventListener("click", () => {
+      selectedMode = m.id;
+      invoke("player_set_mode", { mode: m.id });
+    });
     box.appendChild(b);
   }
 }
 
+const FILTERS = [
+  { id: "standard", ja: "標準", en: "Standard", d_ja: "256タップ・通過帯域95%。バランス型。", d_en: "256 taps, 95% passband. Balanced." },
+  { id: "sharp", ja: "シャープ", en: "Sharp", d_ja: "1024タップ・99%。帯域が平坦で急峻(計算量大)。", d_en: "1024 taps, 99%. Flat and steep (heavier CPU)." },
+  { id: "soft", ja: "ソフト", en: "Soft", d_ja: "緩やかなロールオフ(90%)。時間軸のにじみが短い。", d_en: "Gentle roll-off (90%). Shorter time-domain ringing." },
+];
+function initFilters() {
+  const box = $("filter-buttons");
+  for (const f of FILTERS) {
+    const b = document.createElement("button");
+    b.dataset.filter = f.id;
+    b.textContent = `${f.ja} / ${f.en}`;
+    b.title = `${f.d_ja}
+${f.d_en}`;
+    b.addEventListener("click", () => invoke("player_set_filter", { filter: f.id }));
+    box.appendChild(b);
+  }
+}
+function renderFilters(st) {
+  document.querySelectorAll("#filter-buttons button").forEach((b) => b.classList.toggle("selected", b.dataset.filter === st.filter));
+  const f = FILTERS.find((x) => x.id === st.filter);
+  if (f) $("filter-desc").textContent = `${f.d_ja} ${f.d_en}(変換が必要なモード B・E で効きます / applies to modes B and E)`;
+}
+
+let selectedMode = null; // クリックした直後に、再生側の反映を待たず表示を切り替える(ボタンと大きなパネルを常に一致させる)
+
 function renderBanner(st) {
-  const a = st.active_mode;
   const playing = st.state !== "stopped";
-  document.querySelectorAll("#mode-buttons button").forEach((b) => b.classList.toggle("selected", b.dataset.mode === st.selected_mode));
+  const sel = selectedMode || st.selected_mode;
+  const shown = modes.find((m) => m.id === sel) || st.active_mode; // 大きなパネルは「選んだモード」を表示する
+  const actual = st.active_mode;
+  const differs = playing && actual.id !== sel; // 反映待ち、または使えなくて別のモードで再生中
+  document.querySelectorAll("#mode-buttons button").forEach((b) => b.classList.toggle("selected", b.dataset.mode === sel));
   const banner = $("mode-banner");
-  banner.classList.toggle("bitperfect", !!a.bit_perfect);
-  banner.classList.toggle("shared", !a.bit_perfect);
-  $("mode-title-ja").textContent = `${a.letter}  ${a.title_ja}` + (playing ? "" : "(選択中 / selected)");
-  $("mode-title-en").textContent = a.title_en;
-  $("mode-route").textContent = playing ? `${st.route_ja}  /  ${st.route_en}` : "";
+  banner.classList.toggle("bitperfect", !!shown.bit_perfect);
+  banner.classList.toggle("shared", !shown.bit_perfect);
+  $("mode-title-ja").textContent = `${shown.letter}  ${shown.title_ja}`;
+  $("mode-title-en").textContent = shown.title_en;
+  let route = playing ? `${st.route_ja}  /  ${st.route_en}` : "";
+  if (differs) {
+    route = st.note
+      ? `実際の再生 / Actually playing: ${actual.letter} ${actual.title_ja} / ${actual.title_en}`
+      : "切り替え中… / Switching…";
+  }
+  $("mode-route").textContent = route;
+  $("mode-desc").textContent = `${shown.desc_ja}  ${shown.desc_en}`;
   const vol100 = Math.round(st.volume * 100) >= 100;
-  const volNote = playing && a.bit_perfect && !vol100 ? "音量が100%未満のため、デジタルで音量処理をしています(ビットパーフェクトではありません)。/ Volume is below 100%, so digital volume is applied (not bit-perfect)." : "";
-  $("mode-note").textContent = [st.note, volNote].filter(Boolean).join("  ");
-  $("mode-desc").textContent = `${a.desc_ja}  ${a.desc_en}`;
+  const volNote = playing && actual.bit_perfect && !vol100 ? "音量が100%未満のため、デジタルで音量処理をしています(ビットパーフェクトではありません)。/ Volume is below 100%, so digital volume is applied (not bit-perfect)." : "";
+  $("mode-note").textContent = [differs ? st.note : st.note, volNote].filter(Boolean).join("  ");
+  if (selectedMode && st.selected_mode === selectedMode && (!playing || actual.id === selectedMode || st.note)) selectedMode = null; // 反映済み
 }
 
 async function poll() {
@@ -173,6 +211,7 @@ async function poll() {
     const name = st.path ? baseName(st.path) : "";
     $("status-main").textContent = st.state === "playing" ? `再生中 / Playing: ${name}` : st.state === "paused" ? `一時停止 / Paused: ${name}` : "停止 / Stopped";
     renderBanner(st);
+    renderFilters(st);
     $("status-route").textContent = st.device ? `${st.device}` : "";
     $("status-msg").textContent = st.message || "";
     $("pos-label").textContent = fmtTime(st.position_secs);
@@ -192,6 +231,7 @@ async function poll() {
 setInterval(poll, 250);
 render();
 initModes();
+initFilters();
 
 // 起動時にコマンドライン引数のファイルがあれば、追加して先頭から再生する。
 (async () => {

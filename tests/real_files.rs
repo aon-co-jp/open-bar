@@ -258,3 +258,36 @@ fn dsd_playback_starts_quickly_thanks_to_progressive_conversion() {
     assert!(start < 8.0, "逐次変換なら全曲変換(約35秒)より大幅に速いはず: {start}");
     p.stop();
 }
+
+/// 排他アップサンプル(E)と共有(B)で、10秒間リング枯渇(音切れ)が起きないこと。音は小さいテスト音。
+#[test]
+fn no_underruns_in_shared_and_exclusive_upsample_playback() {
+    use open_bar::player::{PlayMode, PlayState, Player};
+    if !ffmpeg_ok() || cpal::traits::HostTrait::default_output_device(&cpal::default_host()).is_none() {
+        return;
+    }
+    let dir = tmpdir("underrun");
+    let path = dir.join("q.flac");
+    let out = Command::new("ffmpeg").args(["-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=44100:duration=14", "-af", "volume=0.16", "-ac", "2", "-c:a", "flac", path.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success());
+    for mode in [PlayMode::Shared, PlayMode::ExclusiveUpsample, PlayMode::Exclusive] {
+        let p = Player::new();
+        p.set_playlist(vec![path.to_string_lossy().to_string()]);
+        p.set_mode(mode);
+        p.play(0);
+        let t0 = std::time::Instant::now();
+        let s = loop {
+            let s = p.status();
+            if s.state == PlayState::Playing && s.position_secs >= 10.0 {
+                break s;
+            }
+            assert!(t0.elapsed().as_secs_f64() < 40.0, "{mode:?} タイムアウト: {s:?}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        eprintln!("{mode:?}: 実際={} 出力{}Hz 10秒時点の音切れ={}フレーム", s.active_mode.id, s.out_rate_hz, s.underrun_frames);
+        assert_eq!(s.underrun_frames, 0, "{mode:?}: 再生中に音切れ(リング枯渇)が起きた: {s:?}");
+        p.stop();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
