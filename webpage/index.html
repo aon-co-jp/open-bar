@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>open-bar — 高音質プレーヤー / High-resolution audio player</title>
+<meta name="description" content="open-bar: foobar2000をリスペクトした高音質プレーヤー(PCM/DSD/DoP/排他モード)。Web版でも再生できます。 / A foobar2000-inspired high-resolution audio player (PCM/DSD/DoP/exclusive mode). Also plays in the browser." />
+<style>
+  :root { color-scheme: light dark; --bg:#f6f7f9; --panel:#fff; --line:#d8dce3; --text:#1b1f27; --dim:#5d6675; --accent:#1a73e8; --sel:#dbe8fb; --ok:#1e8e4e; --warn:#b26a00; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14161a; --panel:#1e2128; --line:#2c313b; --text:#e6e8ec; --dim:#9aa3b2; --accent:#4da3ff; --sel:#24354d; --ok:#4cc38a; --warn:#e5a13a; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, "Segoe UI", "Yu Gothic UI", sans-serif; line-height:1.65; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 1.5rem 1.2rem 3rem; }
+  h1 { margin:.2rem 0 0; font-size:2rem; }
+  .sub { color:var(--dim); margin:.2rem 0 1rem; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:1rem 1.2rem; margin:1rem 0; }
+  h2 { margin:.1rem 0 .5rem; font-size:1.15rem; }
+  .cta { display:inline-block; padding:.65rem 1.2rem; border-radius:8px; background:var(--accent); color:#fff; text-decoration:none; font-weight:700; margin:.25rem .4rem .25rem 0; border:0; font:inherit; cursor:pointer; }
+  .cta.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  .badge { display:inline-block; background:var(--line); border-radius:4px; padding:0 .5rem; font-size:.8rem; margin-right:.3rem; }
+  .status { font-weight:600; }
+  .status.ok { color:var(--ok); } .status.warn { color:var(--warn); }
+  code { background:rgba(128,128,128,.18); padding:.05rem .35rem; border-radius:3px; }
+  ul { padding-left:1.2rem; }
+  /* player */
+  .transport { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
+  .transport button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:.4rem .8rem; font-size:1rem; cursor:pointer; }
+  .transport button.primary { background:var(--accent); color:#fff; border-color:var(--accent); min-width:3rem; }
+  .seek { display:flex; align-items:center; gap:.5rem; margin:.6rem 0; }
+  .seek input[type=range] { flex:1; }
+  .seek span { color:var(--dim); font-variant-numeric:tabular-nums; min-width:3rem; text-align:center; }
+  table { width:100%; border-collapse:collapse; margin-top:.5rem; }
+  th { text-align:left; color:var(--dim); font-weight:600; padding:.3rem .5rem; border-bottom:1px solid var(--line); white-space:nowrap; }
+  td { padding:.35rem .5rem; border-bottom:1px solid var(--line); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:0; }
+  td.n, th.n { width:2.5rem; text-align:right; } td.f, th.f { width:16rem; max-width:none; } td.t, th.t { width:5rem; text-align:right; max-width:none; }
+  tr.playing { background:var(--sel); font-weight:700; }
+  tr { cursor:pointer; }
+  .drop { border:2px dashed var(--line); border-radius:10px; padding:1.2rem; text-align:center; color:var(--dim); }
+  .drop.over { border-color:var(--accent); background:var(--sel); }
+  .msg { color:var(--warn); font-size:.9rem; min-height:1.2rem; }
+  footer { color:var(--dim); font-size:.85rem; margin-top:2rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>open-bar</h1>
+  <p class="sub">高音質プレーヤー(PCM / DSD / DoP / 排他モード) — foobar2000をリスペクト<br />High-resolution audio player (PCM / DSD / DoP / exclusive mode), inspired by foobar2000</p>
+  <div><span class="badge">Windows</span><span class="badge">macOS</span><span class="badge">Linux</span><span class="badge">Web</span></div>
+
+  <section id="launch">
+    <h2>デスクトップ版 / Desktop app</h2>
+    <p id="launch-status" class="status">インストール済みか確認しています… / Checking whether the app is installed…</p>
+    <p>
+      <a id="dl-main" class="cta" href="https://github.com/aon-co-jp/open-bar/releases/latest">インストーラーをダウンロード / Download the installer</a>
+      <a class="cta secondary" href="https://github.com/aon-co-jp/open-bar/releases/latest">すべてのOS / All platforms</a>
+      <button id="launch-btn" class="cta secondary" type="button">インストール版を起動 / Launch the installed app</button>
+    </p>
+    <p id="dl-version" style="color:var(--dim);font-size:.9rem"></p>
+    <p style="color:var(--dim);font-size:.9rem">
+      インストール済みの環境でこのページを開くと、インストール版(<code>openbar://</code>)が自動で起動します(初回はブラウザの確認が出ます)。未インストールなら、下のWeb版でそのまま再生できます。<br />
+      With the app installed, opening this page launches it automatically (<code>openbar://</code>; the browser asks for permission the first time). Otherwise use the web player below.
+    </p>
+    <label style="font-size:.9rem"><input type="checkbox" id="no-auto" /> 自動起動しない / Don't launch automatically</label>
+    <div id="running" style="margin-top:.8rem">
+      <div style="font-weight:700;margin-bottom:.3rem">この端末の起動状態 / Running status on this device</div>
+      <div id="run-list"></div>
+      <p style="color:var(--dim);font-size:.85rem;margin:.4rem 0 0">アクセスしているこの端末(このブラウザ)のアプリだけを表示します。他の端末の状態や再生内容は見えず、曲名などは送信されません。<br />Only the app on the device (browser) you are using is shown. Other devices and what you play are never visible; no track names are sent.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>open-barとは / What is open-bar</h2>
+    <ul>
+      <li>PCM(WAV/FLAC/MP3/AAC/Opus…)とDSD(DSF/DFF)を高音質で再生。デスクトップ版は<b>排他モード(ビットパーフェクト)</b>・<b>DoP</b>・高品質アップサンプルに対応。<br />Plays PCM and DSD in high quality. The desktop app adds <b>exclusive (bit-perfect) mode</b>, <b>DoP</b> and high-quality upsampling.</li>
+      <li>再生モード(A/B/E/D)を再生中に切り替えて聴き比べ、現在のモードを日英で大きく表示。<br />Switch playback modes (A/B/E/D) during playback to compare; the current mode is shown large in Japanese and English.</li>
+      <li>MQAは復号しません(非公開技術)。MQA対応DACへは素通しの判断のみ。<br />MQA is not decoded (proprietary); only pass-through decisions for MQA-capable DACs.</li>
+    </ul>
+    <p>
+      <a href="https://github.com/aon-co-jp/open-bar">GitHub: open-bar</a> ・
+      <a href="https://github.com/aon-co-jp/open-bar#readme">README</a> ・
+      <a href="https://github.com/aon-co-jp/open-mqa-dsd">open-mqa-dsd</a> ・
+      <a href="https://github.com/aon-co-jp/open-av">open-av</a> ・
+      <a href="https://github.com/aon-co-jp/make-disk/releases/latest">make-disk</a>
+    </p>
+  </section>
+
+  <section id="player">
+    <h2>Web版プレーヤー / Web player</h2>
+    <p style="color:var(--dim);font-size:.9rem">
+      ファイルはブラウザ内だけで処理され、アップロードされません。Web版はブラウザ/OS経由(共有モード)の再生で、排他モード・DoP・アップサンプルフィルターの切り替えはデスクトップ版のみです。DSD(DSF)は<b>ブラウザ内でPCMに変換</b>して再生します。<br />
+      Files are processed in your browser only and never uploaded. The web player plays through the browser/OS (shared mode); exclusive mode, DoP and filter selection are desktop-only. DSD (DSF) is converted to PCM <b>in the browser</b>.
+    </p>
+    <div id="drop" class="drop">
+      <input id="files" type="file" multiple accept=".wav,.flac,.mp3,.aac,.m4a,.ogg,.opus,.dsf,.mp4,.webm,audio/*" />
+      <div>ここにファイルをドラッグ&ドロップ / Drag &amp; drop files here</div>
+    </div>
+    <div class="transport" style="margin-top:.8rem">
+      <button id="prev" title="前 / Previous">⏮</button>
+      <button id="play" class="primary" title="再生・一時停止 / Play・Pause">▶</button>
+      <button id="stop" title="停止 / Stop">⏹</button>
+      <button id="next" title="次 / Next">⏭</button>
+      <label style="margin-left:auto;color:var(--dim)">🔊 <input id="vol" type="range" min="0" max="100" value="80" /></label>
+    </div>
+    <div class="seek"><span id="pos">0:00</span><input id="seek" type="range" min="0" max="1000" value="0" /><span id="dur">0:00</span></div>
+    <div id="now" class="status"></div>
+    <div id="msg" class="msg"></div>
+    <table><thead><tr><th class="n">#</th><th>ファイル / File</th><th class="f">形式 / Format</th><th class="t">長さ / Length</th></tr></thead><tbody id="list"></tbody></table>
+  </section>
+
+  <footer>open-bar は MIT OR Apache-2.0。ページ内で使う音声処理はブラウザ内で完結します。 / open-bar is MIT OR Apache-2.0; audio processing on this page stays in your browser.</footer>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

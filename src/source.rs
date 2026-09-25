@@ -237,3 +237,28 @@ mod tests {
         assert!(s.read(10, 5).is_empty());
     }
 }
+
+#[cfg(test)]
+mod start_probe {
+    use super::*;
+
+    /// 実DSDファイルの先頭(過渡応答)を調べる手動確認用: 10msごとの最大振幅と、定常状態(1秒後)との比。
+    #[test]
+    #[ignore]
+    fn print_start_transient_of_a_real_dsf() {
+        let path = std::env::var("OPEN_BAR_DSF").unwrap_or_else(|_| "F:/tmp/cd_dsd/Track04.dsf".into());
+        let s = open_mqa_dsd::read_dsd_file(&path).unwrap();
+        let src = DsdPcmSource::new(s, DsdToPcm { out_rate_hz: 176_400, cutoff_hz: 40_000.0 }).unwrap();
+        let v = src.read(0, 176_400 * 2);
+        let ch = src.channels();
+        let win = 1764; // 10ms
+        let peak = |from: usize| v[from * ch..(from + win) * ch].iter().fold(0f32, |a, x| a.max(x.abs()));
+        let steady = (10..20).map(|i| peak(i * win)).fold(0f32, f32::max);
+        eprintln!("定常(0.1〜0.2秒)の最大振幅: {steady:.4}");
+        for i in 0..12 {
+            eprintln!("{:>3}〜{:>3}ms: 最大{:.4} (定常比 {:.2})", i * 10, (i + 1) * 10, peak(i * win), peak(i * win) / steady.max(1e-9));
+        }
+        let first: Vec<f32> = v[..16].to_vec();
+        eprintln!("先頭8フレーム: {:?}", first);
+    }
+}

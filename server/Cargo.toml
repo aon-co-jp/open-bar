@@ -1,0 +1,11 @@
+[package]
+name = "open-bar-web"
+version = "0.1.0"
+edition = "2021"
+description = "open-bar web server: static landing/player page + device presence API (which devices are running the app)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

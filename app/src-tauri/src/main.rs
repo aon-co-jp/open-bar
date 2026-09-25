@@ -4,7 +4,9 @@
 use open_bar::media::{self, MediaInfo};
 use open_bar::output::ResampleFilter;
 use open_bar::player::{mode_text, ModeText, PlayMode, Player, Status};
-use tauri::State;
+mod presence;
+
+use tauri::{Emitter, Manager, State};
 
 #[tauri::command]
 fn probe_file(path: String) -> MediaInfo {
@@ -99,9 +101,67 @@ fn player_status(player: State<Player>) -> Status {
     player.status()
 }
 
+/// 起動引数(ファイル/`openbar://`のURL)を処理する: URLのトークンは保存、ファイルはフロントへ渡して追加・再生する。
+fn handle_args(app: &tauri::AppHandle, args: &[String], cfg_path: &std::path::Path, shared: &presence::Shared) {
+    let mut files = Vec::new();
+    for a in args {
+        if let Some(t) = presence::token_from_url(a) {
+            let mut c = shared.lock().unwrap();
+            c.token = Some(t);
+            presence::save(cfg_path, &c);
+        } else if !a.starts_with("openbar://") && std::path::Path::new(a).is_file() {
+            files.push(a.clone());
+        }
+    }
+    if !files.is_empty() {
+        let _ = app.emit("open-files", files);
+    }
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 fn main() {
+    let shared: presence::Shared = std::sync::Arc::new(std::sync::Mutex::new(presence::Config { token: None, enabled: true }));
+    let shared_for_second = shared.clone();
     tauri::Builder::default()
+        // 2つ目の起動(Webページからの`openbar://`起動やファイルを開く操作)は、既に動いているウィンドウへ渡す
+        .plugin(tauri_plugin_single_instance::init(move |app, args, _cwd| {
+            let dir = app.path().app_config_dir().unwrap_or_default();
+            handle_args(app, &args, &presence::config_path(dir), &shared_for_second);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(move |app| {
+            let dir = app.path().app_config_dir().unwrap_or_default();
+            let cfg_path = presence::config_path(dir);
+            *shared.lock().unwrap() = presence::load(&cfg_path);
+            // 起動時の引数(`openbar://launch?token=…`やファイル)
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            handle_args(app.handle(), &args, &cfg_path, &shared);
+            // 開発時・一部環境でスキームが未登録なら登録する(インストーラー経由なら登録済み)
+            #[cfg(any(windows, target_os = "linux"))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let _ = app.deep_link().register("openbar");
+            }
+            // 心拍: トークンがあり、有効な間だけ、約10秒ごとに送る
+            let handle = app.handle().clone();
+            let shared_beat = shared.clone();
+            std::thread::spawn(move || {
+                let url = std::env::var("OPEN_BAR_PRESENCE_URL").unwrap_or_else(|_| presence::DEFAULT_URL.to_string());
+                loop {
+                    let cfg = shared_beat.lock().unwrap().clone();
+                    if let (Some(t), true) = (cfg.token, cfg.enabled) {
+                        let playing = handle.state::<Player>().status().state == open_bar::player::PlayState::Playing;
+                        let _ = presence::send_beat(&url, &t, if playing { "playing" } else { "idle" }, env!("CARGO_PKG_VERSION"));
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
+            });
+            Ok(())
+        })
         .manage(Player::new())
         .invoke_handler(tauri::generate_handler![probe_file, scan_folder, startup_files, player_set_playlist, player_play, player_pause, player_resume, player_stop, player_next, player_prev, player_seek, player_set_volume, player_status, player_modes, player_set_mode, player_set_filter, player_set_auto_version])
         .run(tauri::generate_context!())

@@ -253,3 +253,14 @@ initFilters();
     $("status-msg").textContent = String(e);
   }
 })();
+
+// 2つ目の起動(「プログラムから開く」・Webページからの起動)で渡されたファイルを、実行中のウィンドウへ追加して再生する。
+if (window.__TAURI__.event) {
+  window.__TAURI__.event.listen("open-files", async (ev) => {
+    const files = ev.payload || [];
+    if (!files.length) return;
+    const first = items.length;
+    await addPaths(files);
+    await playIndex(first);
+  });
+}
