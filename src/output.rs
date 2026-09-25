@@ -47,13 +47,39 @@ pub struct PlayReport {
     pub elapsed_secs: f64,
 }
 
-/// インターリーブしたf32を`from`Hz→`to`Hzへ高品質変換する(sinc補間、長さは比に応じて変わる)。
+/// アップサンプル(リサンプル)フィルターの選択。聴き比べ用に特性の違う3種類を用意する(いずれもリニア位相のsinc補間)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResampleFilter {
+    /// 標準: 256タップ、通過帯域は原音のナイキストの95%まで。バランス型。
+    #[default]
+    Standard,
+    /// シャープ: 1024タップ・カットオフ99%。通過帯域が平坦で急峻(プリリンギングの範囲は長くなる)。計算量は大きい。
+    Sharp,
+    /// ソフト: 緩やかなロールオフ(カットオフ90%)。急峻なフィルターより時間軸のにじみ(リンギング)が短い。
+    Soft,
+}
+
+pub fn sinc_params(f: ResampleFilter) -> SincInterpolationParameters {
+    match f {
+        ResampleFilter::Standard => SincInterpolationParameters { sinc_len: 256, f_cutoff: 0.95, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 },
+        ResampleFilter::Sharp => SincInterpolationParameters { sinc_len: 1024, f_cutoff: 0.99, interpolation: SincInterpolationType::Cubic, oversampling_factor: 512, window: WindowFunction::BlackmanHarris2 },
+        ResampleFilter::Soft => SincInterpolationParameters { sinc_len: 256, f_cutoff: 0.90, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::Blackman2 },
+    }
+}
+
+/// インターリーブしたf32を`from`Hz→`to`Hzへ高品質変換する(標準フィルター)。
 pub fn resample(samples: &[f32], channels: usize, from: u32, to: u32) -> Result<Vec<f32>, OutputError> {
+    resample_with(samples, channels, from, to, ResampleFilter::Standard)
+}
+
+/// フィルターを指定して変換する(sinc補間、長さは比に応じて変わる)。
+pub fn resample_with(samples: &[f32], channels: usize, from: u32, to: u32, filter: ResampleFilter) -> Result<Vec<f32>, OutputError> {
     if from == to {
         return Ok(samples.to_vec());
     }
     let frames = samples.len() / channels;
-    let params = SincInterpolationParameters { sinc_len: 256, f_cutoff: 0.95, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 };
+    let params = sinc_params(filter);
     let chunk = 2048usize;
     let mut rs = SincFixedIn::<f32>::new(to as f64 / from as f64, 2.0, params, chunk, channels).map_err(|e| OutputError::Resample(e.to_string()))?;
     let planar: Vec<Vec<f32>> = (0..channels).map(|c| samples.iter().skip(c).step_by(channels).copied().collect()).collect();
@@ -223,5 +249,40 @@ mod tests {
         assert_eq!(map_channels(&[0.5, -0.5], 1, 2), vec![0.5, 0.5, -0.5, -0.5]);
         assert_eq!(map_channels(&[1.0, 2.0, 3.0, 4.0], 2, 4), vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0]);
         assert_eq!(map_channels(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 3, 2), vec![1.0, 2.0, 4.0, 5.0]);
+    }
+
+    /// フィルターごとの実測特性: 通過帯域(20kHz)のゲインと、1kHzの鏡像(43.1kHz)の抑圧量を測る。
+    #[test]
+    fn upsampling_filters_have_the_advertised_passband_and_image_rejection() {
+        let goertzel = |x: &[f32], rate: u32, freq: f64| -> f64 {
+            let (mut s, mut c) = (0.0, 0.0);
+            for (i, v) in x.iter().enumerate() {
+                let ph = 2.0 * std::f64::consts::PI * freq * i as f64 / rate as f64;
+                s += *v as f64 * ph.sin();
+                c += *v as f64 * ph.cos();
+            }
+            2.0 * (s * s + c * c).sqrt() / x.len() as f64
+        };
+        let db = |a: f64| 20.0 * a.max(1e-12).log10();
+        for filter in [ResampleFilter::Standard, ResampleFilter::Sharp, ResampleFilter::Soft] {
+            let measure = |freq: f64, at: f64| -> f64 {
+                let x: Vec<f32> = (0..88_200).map(|i| 0.5 * (2.0 * std::f32::consts::PI * freq as f32 * i as f32 / 44_100.0).sin()).collect();
+                let y = resample_with(&x, 1, 44_100, 352_800, filter).unwrap();
+                let seg = &y[y.len() / 4..y.len() * 3 / 4]; // フィルターの立ち上がり・終端を避ける
+                db(goertzel(seg, 352_800, at) / 0.5)
+            };
+            // 位相の連続性のため、セグメント開始位置ぶんの周波数はそのまま(振幅のみ比較)
+            let pass20 = measure(20_000.0, 20_000.0);
+            let pass1 = measure(1_000.0, 1_000.0);
+            let image = measure(1_000.0, 43_100.0);
+            eprintln!("{filter:?}: 1kHz={pass1:.2}dB 20kHz={pass20:.2}dB 鏡像(43.1kHz)={image:.1}dB");
+            assert!(pass1.abs() < 0.05, "{filter:?} 1kHzは平坦: {pass1}");
+            assert!(image < -90.0, "{filter:?} 鏡像の抑圧が不足: {image}");
+            match filter {
+                ResampleFilter::Sharp => assert!(pass20.abs() < 0.1, "シャープは20kHzまで平坦: {pass20}"),
+                ResampleFilter::Standard => assert!(pass20.abs() < 0.5, "標準も20kHzはほぼ平坦: {pass20}"),
+                ResampleFilter::Soft => assert!(pass20 < -0.5, "ソフトは20kHzを緩やかに落とす: {pass20}"),
+            }
+        }
     }
 }

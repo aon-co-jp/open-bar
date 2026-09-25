@@ -64,3 +64,9 @@ tbody tr.playing { background: var(--play); font-weight: 600; }
 .mode-note { margin-top: 6px; font-size: 13px; color: #d9822b; font-weight: 600; }
 
 td.c-num { overflow: visible; max-width: none; width: 56px; min-width: 56px; }
+
+.filterbar { display: flex; align-items: center; gap: 10px; padding: 6px 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.filter-label { color: var(--dim); font-size: 13px; font-weight: 600; }
+#filter-buttons button { margin-right: 6px; padding: 4px 10px; }
+#filter-buttons button.selected { border-color: var(--accent); background: var(--sel); font-weight: 700; }
+.filter-desc { color: var(--dim); font-size: 12px; }

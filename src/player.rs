@@ -12,12 +12,12 @@
 //!
 //! 曲の切り替わりに短い隙間(数十ms)が入る(ギャップレスは次の段階)。
 
-use crate::output::map_channels_pub;
+use crate::output::{map_channels_pub, sinc_params, ResampleFilter};
 use crate::pcm::decode_file;
 use crate::source::{DopSource, DsdPcmSource, PcmSource, Source};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::{Resampler, SincFixedIn};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -118,6 +118,10 @@ pub struct Status {
     pub note: String,
     /// 直近のエラー(なければ空)。
     pub message: String,
+    /// 再生中の音切れ(リング枯渇)フレーム数。0が正常。
+    pub underrun_frames: u64,
+    /// 選択中のアップサンプルフィルター。
+    pub filter: ResampleFilter,
 }
 
 enum Cmd {
@@ -130,6 +134,7 @@ enum Cmd {
     Next,
     Prev,
     SetMode(PlayMode),
+    SetFilter(ResampleFilter),
     Quit,
 }
 
@@ -145,11 +150,16 @@ struct Track {
     seek_gen: AtomicU64,
     seek_src_frame: AtomicU64,
     consumed: AtomicU64,
+    /// 再生中にリングが空で無音を出した回数(フレーム数)。0でなければ音切れ・ノイズの原因になり得る。
+    underrun_frames: AtomicU64,
+    /// 先読みバッファが溜まるまで(または曲の終わりまで)は無音を出して待つ。
+    primed: AtomicBool,
     /// 現在の世代の開始位置(出力フレーム)。位置 = (base + consumed) / out_rate。
     base: AtomicU64,
     out_rate: u32,
     out_ch: usize,
     total_secs: f64,
+    filter: ResampleFilter,
 }
 
 struct Shared {
@@ -181,6 +191,8 @@ fn blank_status(mode: PlayMode) -> Status {
         route_en: String::new(),
         note: String::new(),
         message: String::new(),
+        underrun_frames: 0,
+        filter: ResampleFilter::Standard,
     }
 }
 
@@ -222,6 +234,10 @@ impl Player {
     pub fn set_mode(&self, mode: PlayMode) {
         let _ = self.tx.send(Cmd::SetMode(mode));
     }
+    /// アップサンプルのフィルターを切り替える。再生中なら同じ位置から新しいフィルターで再開する。
+    pub fn set_filter(&self, f: ResampleFilter) {
+        let _ = self.tx.send(Cmd::SetFilter(f));
+    }
     pub fn set_volume(&self, v: f32) {
         self.volume.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
@@ -235,6 +251,9 @@ impl Player {
             s.position_secs = (frames as f64 / t.out_rate.max(1) as f64).min(t.total_secs);
         }
         s.volume = f32::from_bits(self.volume.load(Ordering::Relaxed));
+        if let Some(t) = &g.track {
+            s.underrun_frames = t.underrun_frames.load(Ordering::Relaxed);
+        }
         s
     }
 }
@@ -265,14 +284,15 @@ fn khz(hz: u32) -> String {
 }
 
 const RING_SECS: f64 = 8.0;
+/// 再生を始める前に溜める量(秒)。DoPは1フレームでも欠けるとDAC側のDSD判定が外れてノイズになるため、余裕を持たせる。
+const PRIME_SECS: f64 = 0.75;
 const CHUNK: usize = 2048;
 
-fn make_resampler(from: u32, to: u32, ch: usize) -> Option<SincFixedIn<f32>> {
+fn make_resampler(from: u32, to: u32, ch: usize, filter: ResampleFilter) -> Option<SincFixedIn<f32>> {
     if from == to {
         return None;
     }
-    let params = SincInterpolationParameters { sinc_len: 256, f_cutoff: 0.95, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 };
-    SincFixedIn::<f32>::new(to as f64 / from as f64, 2.0, params, CHUNK, ch).ok()
+    SincFixedIn::<f32>::new(to as f64 / from as f64, 2.0, sinc_params(filter), CHUNK, ch).ok()
 }
 
 /// 生産スレッド: ソースを`CHUNK`フレームずつ読み→(必要なら)リサンプル→チャンネル変換→リングへ。リングが満杯なら待つ。
@@ -282,7 +302,7 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
     let src_rate = src.rate_hz();
     let mut gen_seen = track.seek_gen.load(Ordering::Acquire);
     let mut pos: u64 = 0;
-    let mut rs = make_resampler(src_rate, track.out_rate, ch);
+    let mut rs = make_resampler(src_rate, track.out_rate, ch, track.filter);
     let capacity = (RING_SECS * track.out_rate as f64) as usize * track.out_ch;
     loop {
         if track.stop.load(Ordering::Relaxed) {
@@ -292,11 +312,12 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
         if g != gen_seen {
             gen_seen = g;
             pos = track.seek_src_frame.load(Ordering::Acquire).min(src_frames);
-            rs = make_resampler(src_rate, track.out_rate, ch);
+            rs = make_resampler(src_rate, track.out_rate, ch, track.filter);
             track.producer_done.store(false, Ordering::Release);
             let mut ring = track.ring.lock().unwrap();
             ring.clear();
             track.consumed.store(0, Ordering::Release);
+            track.primed.store(false, Ordering::Release);
             track.base.store((pos as f64 * track.out_rate as f64 / src_rate as f64) as u64, Ordering::Release);
         }
         if pos >= src_frames {
@@ -367,6 +388,14 @@ where
                     return;
                 };
                 let avail = ring.len() / ch;
+                if !track.primed.load(Ordering::Acquire) {
+                    if avail as f64 >= PRIME_SECS * track.out_rate as f64 || track.producer_done.load(Ordering::Acquire) {
+                        track.primed.store(true, Ordering::Release);
+                    } else {
+                        silent(out); // 先読みが溜まるまで待つ(開始直後・シーク直後の音切れを防ぐ)
+                        return;
+                    }
+                }
                 let take = n.min(avail);
                 for f in 0..take {
                     for c in 0..ch {
@@ -377,8 +406,12 @@ where
                     *o = T::from_sample(0.0);
                 }
                 track.consumed.fetch_add(take as u64, Ordering::Relaxed);
-                if take < n && ring.is_empty() && track.producer_done.load(Ordering::Acquire) {
-                    track.ended.store(true, Ordering::Release);
+                if take < n {
+                    if ring.is_empty() && track.producer_done.load(Ordering::Acquire) {
+                        track.ended.store(true, Ordering::Release);
+                    } else {
+                        track.underrun_frames.fetch_add((n - take) as u64, Ordering::Relaxed);
+                    }
                 }
             },
             |e| eprintln!("出力ストリームのエラー: {e}"),
@@ -404,7 +437,14 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
         let paused = track.paused.load(Ordering::Relaxed);
         let vol = f32::from_bits(volume.load(Ordering::Relaxed));
         let mut ring = track.ring.lock().unwrap();
-        let avail = if paused { 0 } else { ring.len() / ch };
+        let ring_frames = ring.len() / ch;
+        if !paused && !track.primed.load(Ordering::Acquire) {
+            if ring_frames as f64 >= PRIME_SECS * track.out_rate as f64 || track.producer_done.load(Ordering::Acquire) {
+                track.primed.store(true, Ordering::Release);
+            }
+        }
+        // 先読みが溜まるまでは無音(DoPでも、開始前の無音はマーカー無しのPCM無音で問題ない)
+        let avail = if paused || !track.primed.load(Ordering::Acquire) { 0 } else { ring_frames };
         let take = n.min(avail);
         for f in 0..n {
             for _c in 0..chn {
@@ -421,9 +461,12 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
             }
         }
         track.consumed.fetch_add(take as u64, Ordering::Relaxed);
-        if !paused && take < n && ring.is_empty() && track.producer_done.load(Ordering::Acquire) {
-            track.ended.store(true, Ordering::Release);
-            return false;
+        if !paused && track.primed.load(Ordering::Acquire) && take < n {
+            if ring.is_empty() && track.producer_done.load(Ordering::Acquire) {
+                track.ended.store(true, Ordering::Release);
+                return false;
+            }
+            track.underrun_frames.fetch_add((n - take) as u64, Ordering::Relaxed);
         }
         true
     });
@@ -434,7 +477,7 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
 }
 
 fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume: Arc<AtomicU32>) {
-    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, stream: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
+    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, stream: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
     loop {
         let ended = shared.lock().unwrap().track.as_ref().is_some_and(|t| t.ended.load(Ordering::Acquire));
         let cmd = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -497,6 +540,20 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume
                     ctx.start_track(i, 0.0);
                 }
             }
+            Cmd::SetFilter(f) => {
+                ctx.filter = f;
+                let (playing, pos) = {
+                    let g = shared.lock().unwrap();
+                    let pos = g.track.as_ref().map(|t| (t.base.load(Ordering::Relaxed) + t.consumed.load(Ordering::Relaxed)) as f64 / t.out_rate.max(1) as f64).unwrap_or(0.0);
+                    (g.track.is_some(), pos)
+                };
+                shared.lock().unwrap().status.filter = f;
+                if playing {
+                    if let Some(i) = ctx.current {
+                        ctx.start_track(i, pos);
+                    }
+                }
+            }
             Cmd::SetMode(m) => {
                 ctx.mode = m;
                 let (playing, pos) = {
@@ -525,6 +582,7 @@ struct Ctx {
     playlist: Vec<String>,
     current: Option<usize>,
     mode: PlayMode,
+    filter: ResampleFilter,
     stream: Option<cpal::Stream>,
     src_holder: Option<Arc<dyn Source>>,
     host: cpal::Host,
@@ -566,15 +624,17 @@ impl Ctx {
     }
 
     /// ファイルを開いてソースにする。`want_dop`ならDSDをDoPソースに、そうでなければPCM(DSDはDSD→PCM)。
-    fn open_source(&self, path: &str, want_dop: bool) -> Result<Arc<dyn Source>, String> {
+    fn open_source(&self, path: &str, want_dop: bool, dsd_pcm_target: Option<u32>) -> Result<Arc<dyn Source>, String> {
         let info = crate::media::probe(path);
         if info.kind == crate::media::MediaKind::Dsd {
             let s = open_mqa_dsd::read_dsd_file(path).map_err(|e| e.to_string())?;
             if want_dop {
                 return Ok(Arc::new(DopSource::new(s)));
             }
-            // PCM化するときは機器が受けやすい176.4kHz以下(DSD64→176.4k、DSD256→176.4k)
-            let rate = crate::plan::dsd_pcm_candidates(s.rate_hz).into_iter().find(|r| *r <= 176_400).unwrap_or(44_100);
+            // PCM化するときは、最終的な出力レートへ直接変換できるならそれを使う(2段階の変換を避けて音質を保つ)。
+            // 指定が無ければ機器が受けやすい176.4kHz以下(DSD64→176.4k、DSD256→176.4k)。
+            let cands = crate::plan::dsd_pcm_candidates(s.rate_hz);
+            let rate = dsd_pcm_target.filter(|t| cands.contains(t)).or_else(|| cands.iter().copied().find(|r| *r <= 176_400)).unwrap_or(44_100);
             let src = DsdPcmSource::new(s, open_mqa_dsd::DsdToPcm { out_rate_hz: rate, cutoff_hz: 40_000.0 }).map_err(|e| e.to_string())?;
             return Ok(Arc::new(src));
         }
@@ -590,7 +650,9 @@ impl Ctx {
         set_msg(&self.shared, "読み込み中... / Loading...");
         let is_dsd = crate::media::probe(&path).kind == crate::media::MediaKind::Dsd;
         let want_dop = self.mode == PlayMode::Dop && is_dsd;
-        let mut src = match self.open_source(&path, want_dop) {
+        // 排他アップサンプル(E)のDSDは、352.8kHzへ直接変換する(176.4kHz→352.8kHzの2段階変換にしない)
+        let dsd_target = if self.mode == PlayMode::ExclusiveUpsample && is_dsd { Some(352_800) } else { None };
+        let mut src = match self.open_source(&path, want_dop, dsd_target) {
             Ok(s) => s,
             Err(e) => {
                 set_msg(&self.shared, format!("再生できません({path}): {e}"));
@@ -615,11 +677,24 @@ impl Ctx {
                     break;
                 }
             }
+            if !found && dsd_target.is_some() && !is_dop {
+                // 352.8kHzを受け付けない機器: 176.4kHzのPCMに切り替えて、排他(候補は元のレート以上)を探し直す
+                if let Ok(s) = self.open_source(&path, false, None) {
+                    src = s;
+                    for r in exclusive_rates(src.rate_hz(), mode == PlayMode::ExclusiveUpsample) {
+                        if crate::exclusive::probe(r, ch, bits).is_ok() {
+                            exclusive_choice = Some((r, bits));
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
             if !found {
                 if is_dop {
                     // DoPを送れない機器: DSD→PCMに切り替えて、排他(A)で試す
                     note = format!("この機器はDoP({})を受け付けません。DSDをPCMへ変換して再生します。 / This device does not accept DoP ({}). Playing DSD converted to PCM.", khz(src.rate_hz()), khz(src.rate_hz()));
-                    if let Ok(s) = self.open_source(&path, false) {
+                    if let Ok(s) = self.open_source(&path, false, None) {
                         src = s;
                     }
                     mode = PlayMode::Exclusive;
@@ -667,10 +742,13 @@ impl Ctx {
             seek_gen: AtomicU64::new(0),
             seek_src_frame: AtomicU64::new(0),
             consumed: AtomicU64::new(0),
+            underrun_frames: AtomicU64::new(0),
+            primed: AtomicBool::new(false),
             base: AtomicU64::new(0),
             out_rate,
             out_ch,
             total_secs: src.duration_secs(),
+            filter: self.filter,
         });
         if start_secs > 0.0 {
             let frame = ((start_secs * src.rate_hz() as f64) as u64).min(src.total_frames().saturating_sub(1));
