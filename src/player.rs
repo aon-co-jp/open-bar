@@ -487,10 +487,10 @@ where
                     return;
                 }
                 let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                let Ok(mut ring) = track.ring.try_lock() else {
-                    silent(out); // 生産側がリングを更新中(ごく短時間)
-                    return;
-                };
+                // 生産側はここを一瞬(extend/clearのみ)しか持たない。try_lockで諦めて無音を差し込むと
+                // 波形が不連続になりクリック音(バグ報告: 標準モードで再生開始から少し経って一瞬ノイズ)になるため、
+                // 短時間のブロッキングで実際のサンプルを待つ(音切れではなく無音を選ぶのはトラック未指定時だけにする)。
+                let mut ring = track.ring.lock().unwrap();
                 let avail = ring.len() / ch;
                 if !track.primed.load(Ordering::Acquire) {
                     if avail as f64 >= PRIME_SECS * track.out_rate as f64 || track.producer_done.load(Ordering::Acquire) {
@@ -971,8 +971,11 @@ impl Ctx {
                 effective_filter = ResampleFilter::Standard;
             }
         }
+        // 再生開始直後にRING_SECS秒ぶんまで一気に溜め込むため、あらかじめ確保しておく
+        // (再確保のたびにロックを長く保持すると、共有モードの出力コールバックの待ちが伸びてクリックの原因になる)。
+        let ring_capacity_hint = (RING_SECS * out_rate as f64) as usize * out_ch;
         let track = Arc::new(Track {
-            ring: Mutex::new(VecDeque::new()),
+            ring: Mutex::new(VecDeque::with_capacity(ring_capacity_hint)),
             paused: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             stop: AtomicBool::new(false),
