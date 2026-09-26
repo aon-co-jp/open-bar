@@ -529,10 +529,18 @@ where
                     return;
                 }
                 let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                // 生産側はここを一瞬(extend/clearのみ)しか持たない。try_lockで諦めて無音を差し込むと
-                // 波形が不連続になりクリック音(バグ報告: 標準モードで再生開始から少し経って一瞬ノイズ)になるため、
-                // 短時間のブロッキングで実際のサンプルを待つ(音切れではなく無音を選ぶのはトラック未指定時だけにする)。
-                let mut ring = track.ring.lock().unwrap();
+                // 生産側はここを一瞬(extend/clearのみ)しか持たない。以前はtry_lockで即座に諦めて無音を
+                // 差し込んでおり、それが波形の不連続=クリック音の原因だった(バグ報告: 標準モードで再生
+                // 開始から少し経って一瞬ノイズ)。とはいえリアルタイムの出力コールバックを無条件に
+                // ブロックするのも避けたい(何らかの理由で生産側が長く持ったままだと音切れの原因になる)ため、
+                // ごく短時間だけスピンして待ち、それでも取れなければ音切れを選ぶ(無限待ちにはしない)。
+                let mut ring = match { let mut r = track.ring.try_lock(); for _ in 0..64 { if r.is_ok() { break; } std::hint::spin_loop(); r = track.ring.try_lock(); } r } {
+                    Ok(r) => r,
+                    Err(_) => {
+                        silent(out);
+                        return;
+                    }
+                };
                 let avail = ring.len() / ch;
                 if !track.primed.load(Ordering::Acquire) {
                     if avail as f64 >= PRIME_SECS * track.out_rate as f64 || track.producer_done.load(Ordering::Acquire) {
@@ -743,9 +751,12 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume
                 };
                 shared.lock().unwrap().status.treble_restore = on;
                 // 元がMP3のトラックだけ、フィルターの時と同じく同じ位置から掛け直す(補正の有無でTrackを作り直す必要があるため)。
+                // auto_versionで実際に再生されるのは`ctx.playlist[i]`そのものとは限らない(resolve_versionが
+                // 同じ曲の別形式へ差し替えることがある)ため、判定も同じ解決結果に対して行う。
                 if playing {
                     if let Some(i) = ctx.current {
-                        if crate::treble::is_mp3_path(&ctx.playlist[i]) {
+                        let (resolved_i, _) = ctx.resolve_version(i);
+                        if crate::treble::is_mp3_path(&ctx.playlist[resolved_i]) {
                             ctx.start_track(i, pos);
                         }
                     }
@@ -880,7 +891,11 @@ impl Ctx {
         // (open-audio非対応の再生アプリと同じ「互換PCMとして普通に鳴る」動作)。
         if let Some(dsd_path) = extract_open_audio_dsd(path)? {
             let s = open_mqa_dsd::read_dsd_file(&dsd_path.to_string_lossy()).map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_file(&dsd_path);
+            // 抽出先は専用の一時フォルダ(このDSDファイルの他にマニフェストJSONも入っている)なので、
+            // ファイル1つだけでなくフォルダごと片付ける(温存しても再利用しないため)。
+            if let Some(out_dir) = dsd_path.parent() {
+                let _ = std::fs::remove_dir_all(out_dir);
+            }
             if want_dop {
                 return Ok(Arc::new(DopSource::new(s)));
             }
