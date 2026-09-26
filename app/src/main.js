@@ -161,6 +161,7 @@ function initFilters() {
   cut.addEventListener("input", () => ($("cutoff-val").textContent = `${cut.value}%`));
   cut.addEventListener("change", () => invoke("player_set_filter", { filter: { custom: parseInt(cut.value, 10) } }));
   $("auto-version").addEventListener("change", (e) => invoke("player_set_auto_version", { on: e.target.checked }));
+  $("treble-restore").addEventListener("change", (e) => invoke("player_set_treble_restore", { on: e.target.checked }));
   const box = $("filter-buttons");
   for (const f of FILTERS) {
     const b = document.createElement("button");
@@ -177,6 +178,7 @@ function renderFilters(st) {
   document.querySelectorAll("#filter-buttons button").forEach((b) => b.classList.toggle("selected", b.dataset.filter === cur));
   if (cur === "custom") { $("cutoff").value = st.filter.custom; $("cutoff-val").textContent = `${st.filter.custom}%`; }
   $("auto-version").checked = !!st.auto_version;
+  $("treble-restore").checked = !!st.treble_restore;
   $("underrun").textContent = st.state === "playing" ? `音切れ / Underruns: ${st.underrun_frames}` + (st.underrun_frames ? " ⚠" : " ✓") : "";
   const f = FILTERS.find((x) => x.id === cur) || { d_ja: `カスタム(カットオフ${st.filter.custom}%)。`, d_en: `Custom (cutoff ${st.filter.custom}%).` };
   if (f) $("filter-desc").textContent = `${f.d_ja} ${f.d_en}(変換が必要なモード B・E で効きます / applies to modes B and E)`;

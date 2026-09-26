@@ -124,6 +124,8 @@ pub struct Status {
     /// 選択中のアップサンプルフィルター。
     pub filter: ResampleFilter,
     pub auto_version: bool,
+    /// 高音補正(MP3向け) / Treble restoration (for MP3 sources) が有効か(UIのチェックボックスの状態)。
+    pub treble_restore: bool,
 }
 
 enum Cmd {
@@ -138,6 +140,8 @@ enum Cmd {
     SetMode(PlayMode),
     SetFilter(ResampleFilter),
     SetAutoVersion(bool),
+    /// 高音補正(MP3向け) / Treble restoration (for MP3 sources) のON/OFF。
+    SetTrebleRestore(bool),
     Quit,
 }
 
@@ -169,6 +173,9 @@ struct Track {
     fade_gain: AtomicU32,
     /// DoPのペイロードを運んでいる(マーカーは出力スレッドが付け、音量処理は一切しない)。
     dop: bool,
+    /// 高音補正(MP3向け) / Treble restoration (for MP3 sources): このトラックで実際に
+    /// 有効かどうか(元がMP3かつユーザーがチェックを入れている時だけtrue、生成後は不変)。
+    treble_restore: bool,
 }
 
 struct Shared {
@@ -203,6 +210,7 @@ fn blank_status(mode: PlayMode) -> Status {
         underrun_frames: 0,
         filter: ResampleFilter::Standard,
         auto_version: true,
+        treble_restore: false,
     }
 }
 
@@ -251,6 +259,11 @@ impl Player {
     /// 同じ曲の別形式(例: `曲.wav`・`曲.dsd256.dsf`・`曲.dsd64.dsf`)をモードに合わせて自動選択するか(既定: する)。
     pub fn set_auto_version(&self, on: bool) {
         let _ = self.tx.send(Cmd::SetAutoVersion(on));
+    }
+    /// 高音補正(MP3向け) / Treble restoration (for MP3 sources): 元がMP3のときだけ、失われがちな
+    /// 高域(13kHz以上)を穏やかにブーストする(`src/treble.rs`)。再生中なら同じ位置から掛け直す。
+    pub fn set_treble_restore(&self, on: bool) {
+        let _ = self.tx.send(Cmd::SetTrebleRestore(on));
     }
     pub fn set_volume(&self, v: f32) {
         self.volume.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
@@ -335,6 +348,8 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
     let mut rs = make_resampler(src_rate, track.out_rate, ch, track.filter);
     let mut flushed = false;
     let capacity = (RING_SECS * track.out_rate as f64) as usize * track.out_ch;
+    // 高音補正(MP3向け) / Treble restoration (for MP3 sources): このトラックで有効な時だけ生成する。
+    let mut treble = if track.treble_restore { Some(crate::treble::TrebleRestore::new(track.out_rate, track.out_ch)) } else { None };
     let fade_frames = (FADE_SECS * track.out_rate as f64) as usize;
     let mut fade_left = if track.dop { 0 } else { fade_frames }; // 開始・シーク直後はなめらかに立ち上げる(波形の途中から始まるとクリック音になる)
     loop {
@@ -441,8 +456,35 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
             }
             fade_left = fade_left.saturating_sub(frames);
         }
+        if let Some(t) = &mut treble {
+            t.process_interleaved(&mut out, track.out_ch);
+        }
         track.ring.lock().unwrap().extend(out);
     }
+}
+
+/// open-audio(open-avの音声専用プロファイル、`.mka`/`.mkv`)ならDSDトラックを一時ファイルへ取り出し、
+/// そのパスを返す。open-audio以外(またはDSDトラックを持たないopen-audio)は`Ok(None)`(通常のPCM経路へ)。
+/// マニフェストの`kind = "dsd"`トラックは`open-av::pack`が同じファイル名で添付しているので、
+/// `open_av::extract`が書き出した添付一式から拡張子(.dsf/.dff)で探す。
+fn extract_open_audio_dsd(path: &str) -> Result<Option<std::path::PathBuf>, String> {
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if ext != "mka" && ext != "mkv" {
+        return Ok(None);
+    }
+    let info = match open_av::inspect(std::path::Path::new(path)) {
+        Ok(i) => i,
+        Err(_) => return Ok(None), // open-av非対応の普通のmkv/mka
+    };
+    let Some(manifest) = info.manifest else { return Ok(None) };
+    let has_dsd = manifest.audio_tracks.iter().any(|t| t.kind == open_av::TrackKind::Dsd && t.file.is_some());
+    if !has_dsd {
+        return Ok(None);
+    }
+    let out_dir = std::env::temp_dir().join(format!("open_bar_openaudio_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+    let extracted = open_av::extract(std::path::Path::new(path), &out_dir).map_err(|e| e.to_string())?;
+    let dsd_path = extracted.into_iter().find(|p| matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(), Some("dsf") | Some("dff")));
+    Ok(dsd_path)
 }
 
 // ---- 出力バックエンド ----
@@ -625,7 +667,7 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
 }
 
 fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume: Arc<AtomicU32>) {
-    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, shared_out: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
+    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, treble_restore: false, shared_out: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
     loop {
         let ended = shared.lock().unwrap().track.as_ref().is_some_and(|t| t.ended.load(Ordering::Acquire));
         let cmd = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -692,6 +734,23 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume
                 ctx.auto_version = on;
                 shared.lock().unwrap().status.auto_version = on;
             }
+            Cmd::SetTrebleRestore(on) => {
+                ctx.treble_restore = on;
+                let (playing, pos) = {
+                    let g = shared.lock().unwrap();
+                    let pos = g.track.as_ref().map(|t| (t.base.load(Ordering::Relaxed) + t.consumed.load(Ordering::Relaxed)) as f64 / t.out_rate.max(1) as f64).unwrap_or(0.0);
+                    (g.track.is_some(), pos)
+                };
+                shared.lock().unwrap().status.treble_restore = on;
+                // 元がMP3のトラックだけ、フィルターの時と同じく同じ位置から掛け直す(補正の有無でTrackを作り直す必要があるため)。
+                if playing {
+                    if let Some(i) = ctx.current {
+                        if crate::treble::is_mp3_path(&ctx.playlist[i]) {
+                            ctx.start_track(i, pos);
+                        }
+                    }
+                }
+            }
             Cmd::SetFilter(f) => {
                 ctx.filter = f;
                 let (playing, pos) = {
@@ -737,6 +796,9 @@ struct Ctx {
     filter: ResampleFilter,
     /// 同じ曲の別形式(PCM/DSD256/DSD64など)がプレイリストにあるとき、モードに合わせて自動で選ぶ。
     auto_version: bool,
+    /// 高音補正(MP3向け) / Treble restoration (for MP3 sources): ユーザーがUIのチェックボックスで
+    /// 有効にしているか(実際に効くのは、かつ元がMP3のときだけ。`Track::treble_restore`参照)。
+    treble_restore: bool,
     shared_out: Option<SharedOut>,
     src_holder: Option<Arc<dyn Source>>,
     host: cpal::Host,
@@ -813,6 +875,20 @@ impl Ctx {
 
     /// ファイルを開いてソースにする。`want_dop`ならDSDをDoPソースに、そうでなければPCM(DSDはDSD→PCM)。
     fn open_source(&self, path: &str, want_dop: bool, dsd_pcm_target: Option<u32>) -> Result<Arc<dyn Source>, String> {
+        // open-audio(.mka/.mkv): 互換PCM+DSD添付+マニフェストの1ファイル。DSDトラックがあれば
+        // 添付を取り出して通常のDSD再生と同じ経路(DoP/DSD→PCM)へ流す。無ければ下のPCM経路へフォールバックする
+        // (open-audio非対応の再生アプリと同じ「互換PCMとして普通に鳴る」動作)。
+        if let Some(dsd_path) = extract_open_audio_dsd(path)? {
+            let s = open_mqa_dsd::read_dsd_file(&dsd_path.to_string_lossy()).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_file(&dsd_path);
+            if want_dop {
+                return Ok(Arc::new(DopSource::new(s)));
+            }
+            let cands = crate::plan::dsd_pcm_candidates(s.rate_hz);
+            let rate = dsd_pcm_target.filter(|t| cands.contains(t)).or_else(|| cands.iter().copied().find(|r| *r <= 176_400)).unwrap_or(44_100);
+            let src = DsdPcmSource::new(s, open_mqa_dsd::DsdToPcm { out_rate_hz: rate, cutoff_hz: 40_000.0 }).map_err(|e| e.to_string())?;
+            return Ok(Arc::new(src));
+        }
         let info = crate::media::probe(path);
         if info.kind == crate::media::MediaKind::Dsd {
             let s = open_mqa_dsd::read_dsd_file(path).map_err(|e| e.to_string())?;
@@ -994,6 +1070,7 @@ impl Ctx {
             faded: AtomicBool::new(false),
             fade_gain: AtomicU32::new(1.0f32.to_bits()),
             dop: src.kind() == "DoP",
+            treble_restore: self.treble_restore && crate::treble::is_mp3_path(&path),
         });
         if start_secs > 0.0 {
             let frame = ((start_secs * src.rate_hz() as f64) as u64).min(src.total_frames().saturating_sub(1));

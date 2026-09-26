@@ -24,6 +24,9 @@ symphonia = { version = "0.5", features = ["all"] }
 open-mqa = { git = "https://github.com/aon-co-jp/open-mqa", rev = "2d94ada", default-features = false, features = ["opus"] }
 # DSD(DSF/DSDIFF)読み込み・DSD→PCM・DoP(open-mqa-dsd)。
 open-mqa-dsd = { git = "https://github.com/aon-co-jp/open-mqa-dsd", rev = "d885908" }
+# open-audio(.mka): 互換用PCM+DSD添付+MQA/Auro-CX素通し用チャンネル配置メタデータを1ファイルにまとめる
+# オープンな音声コンテナ(open-avの音声専用プロファイル)。DSD添付を取り出して主音声として再生する。
+open-av = { git = "https://github.com/aon-co-jp/open-av", rev = "9608c2a" }
 # CPU命令セット検出(DSD→PCM変換の高速カーネル選択に使う予定、aon-co-jp共通)。
 open-cpu = { git = "https://github.com/aon-co-jp/open-cpu" }
 # 音声出力(共有モード)と高品質リサンプル。`[target.windows]`のwasapiは排他モード用。
