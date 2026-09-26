@@ -1,1 +1,11 @@
 ﻿target/
+
+# tests/fixtures/README.md参照: 音声ファイル自体(WAV/DSF/.mka)はコミットしない
+# (10曲で約3.4GBになりリポジトリが肥大化するため)。scripts/fetch-test-fixtures.sh で
+# 都度取得・生成する。TRACKS.json・README.mdだけはコミット対象。
+tests/fixtures/*.wav
+tests/fixtures/_dsd/
+tests/fixtures/_openaudio/
+tests/fixtures/_full_*.wav
+tests/fixtures/_wavfallback/
+tests/fixtures/_cd/

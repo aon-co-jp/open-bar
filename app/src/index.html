@@ -46,6 +46,10 @@
       <span class="filter-desc">例: <code>曲.wav</code> <code>曲.dsd256.dsf</code> <code>曲.dsd64.dsf</code>(名前の最初の「.」より前が同じなら同じ曲) / same name before the first "." = same track</span>
       <span id="underrun" class="filter-desc"></span>
     </section>
+    <section class="filterbar">
+      <label><input type="checkbox" id="treble-restore" /> 高音補正(元がMP3の時だけ有効) / Treble restoration (only takes effect when the source is MP3)</label>
+      <span class="filter-desc">MP3で失われがちな高域(13kHz以上)を穏やかにブースト / Gently boosts the high frequencies (13 kHz+) that low-bitrate MP3 often discards</span>
+    </section>
 
     <div class="actions">
       <button id="add-files-btn">ファイルを追加… / Add files…</button>
