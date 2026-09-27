@@ -29,6 +29,10 @@ open-mqa-dsd = { git = "https://github.com/aon-co-jp/open-mqa-dsd", rev = "d8859
 open-av = { git = "https://github.com/aon-co-jp/open-av", rev = "9608c2a" }
 # CPU命令セット検出(DSD→PCM変換の高速カーネル選択に使う予定、aon-co-jp共通)。
 open-cpu = { git = "https://github.com/aon-co-jp/open-cpu" }
+# 高音補正(MP3向け)のAI版: AudioSR(実在の拡散モデル)による帯域拡張。Python venvが
+# 無い/未設定の環境では`is_available()`がfalseを返し、既定のリアルタイムEQ(src/treble.rs)
+# のみにフォールバックする(未設定でも再生・ビルドは問題なく動く)。
+open-audio-sr = { git = "https://github.com/aon-co-jp/open-audio-sr", rev = "46526fd" }
 # 音声出力(共有モード)と高品質リサンプル。`[target.windows]`のwasapiは排他モード用。
 cpal = "0.15"
 rubato = "0.15"

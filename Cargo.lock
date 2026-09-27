@@ -2727,6 +2727,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "open-audio-sr"
+version = "0.1.0"
+source = "git+https://github.com/aon-co-jp/open-audio-sr?rev=46526fd#46526fdf47658b8733a377bef842ed733ba97f19"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "open-av"
 version = "0.1.0"
 source = "git+https://github.com/aon-co-jp/open-av?rev=9608c2a#9608c2a775eeb52caa8ef942bd0805b04178761e"
@@ -2741,6 +2749,7 @@ name = "open-bar"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "open-audio-sr",
  "open-av",
  "open-cpu",
  "open-mqa",

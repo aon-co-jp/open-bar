@@ -28,6 +28,7 @@
 | MQA: タグでの判別と、MQA対応DACへのビットパーフェクト素通しの判断 | ✅ 判別・計画のみ(**復号はしない**) |
 | 映像+音声の自由な組み合わせ(`.obar.json`、同名ファイルの自動ペアリング) | ✅ 形式・検証・ペアリング(同期再生は次段階) |
 | WebM内Opusなどsymphoniaが読めない形式 | ffmpegがあればフォールバック(実ファイルで確認) |
+| 高音補正(MP3向け): 既定はリアルタイムEQ、[`open-audio-sr`](https://github.com/aon-co-jp/open-audio-sr)(実在の拡散モデルAudioSR)が使えればAIで実際に高域を復元(バックグラウンド生成→次回再生からキャッシュを使用) | ✅ EQは単体テスト、AI版はopen-audio-sr側で実機検証済み・open-bar組み込みは単体テスト(`ai_treble`) |
 | DST圧縮のDSDIFF | 未対応(明示エラー) |
 
 ## MQAについて(正直な開示)

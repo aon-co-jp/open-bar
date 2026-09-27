@@ -25,3 +25,23 @@ foobar2000をリスペクトした高音質・高画質優先のプレーヤー(
 - **2026-09-25 続き2**: 聴取結果(ユーザー): 音質は B(共有+384k)が最良、次いで D/E/A。D(DoP)はD40 PROでノイズ(非対応DACの可能性、または音切れでDoPが外れた可能性)。対策: 先読み(0.75秒)を溜めてから再生、リング枯渇の計測(`Status.underrun_frames`、B/E/Aとも10秒で0を実測)、DSDを最終レートへ直接変換(E)、アップサンプルフィルター3種(標準/シャープ/ソフト。実測: 鏡像抑圧 -142/-150/-142 dB、20kHzゲイン 0/0/-12.2 dB)、GUIのモードボタンと大パネルの不一致を修正(クリックで即座に選択モードを表示、実際と違えば理由を表示)。テスト: 単体21+実ファイル9が通過。
 - **2026-09-25 続き3(リリース v0.1.0)**: ユーザーの聴取が判明: 今までのレポートはプレイリスト1(PCM)だけ。2(DSD256)ではノイズ無しで **D>E>B>A**。シャープ=音切れ・スローテンポ・ノイズ(バグ)→原因は重い補間の実時間割れ。対策: `polyphase.rs`(整数倍ポリフェーズFIR、標準10倍/シャープ4.5倍/ソフト15倍 実時間)、自動フォールバック(実時間3倍未満なら標準へ)、DoPのマーカーを出力側で連続付与(pause/seek/underrunはDSD無音0x69で埋める)、フェードイン/アウト、MMCSS+長め周期、同じ曲の別形式(PCM/DSD256/DSD64)をモードで自動選択、カットオフ可変。リリースワークフロー追加(`v*`タグ→Windows/macOS/Linux)。テスト: 単体28+実ファイル10が通過。既知の限界: 曲間の隙間、libmpv映像未実装、ASIO DSD未実装、macOS/Linuxは未検証(CI次第)。
 - **2026-09-25 続き4(easy-web.tokyo/open-bar)**: Web版(`webpage/`: ランディング+ブラウザ内プレーヤー。PCMはWebAudio、DSFはWebWorkerでDSD→PCM(実DSD64を350msで再生開始・シーク確認))と、Rust製Webサーバー(`server/`、静的配信+プレゼンスAPI、単体6件)。インストール版の自動起動は`openbar://launch?token=…`(ページがトークンを付けて起動→アプリが同じトークンで約10秒ごとに心拍→ページが「起動中」表示)。表示はアクセス元の端末(トークン=ブラウザ)のアプリだけ(他端末・再生内容は見えない、曲名は送らない)。アプリ側: deep-link+single-instance+`presence.rs`(単体3件)。スマホ/タブレット版アプリは未提供(ページは「準備中」と表示)。VPSは`/root/repository/open-bar`+`open-bar-web.service`+open-web-serverの`domains.toml`に`/open-bar`を追加、easy-web.tokyoの紹介カード追加(open-easy-web-appのshell.rs)。
+- **2026-09-27(高音補正・open-mqa-dsdコンテナ再生・バグ修正)**: MP3向け高音補正を2段構えで実装。
+  (1) 既定: `src/treble.rs`(RBJハイシェルフEQ、13kHz以上を+6dB)をリアルタイムに掛ける近似。
+  (2) AI版: `src/ai_treble.rs`が[`open-audio-sr`](https://github.com/aon-co-jp/open-audio-sr)
+  (実在の拡散モデルAudioSR)を呼び、実際に高域を生成する。推論はCPUで数分〜数十分かかるため
+  **再生開始はブロックしない**設計: まだAI強化版のキャッシュが無ければその場では作らず
+  バックグラウンドで生成を開始し、今回の再生は(1)のリアルタイムEQにフォールバックする。次回
+  同じ曲を再生するときにキャッシュ(`%LOCALAPPDATA%\open-bar\ai-treble-cache`、パス+更新日時+
+  サイズがキー)があればそちらを再生し、このときはリアルタイムEQを重ねて掛けない。
+  `open-audio-sr`のPython venvが無い/未設定の環境では`is_available()`がfalseになり、常に(1)へ
+  フォールバックする(未設定でも問題なく動く)。あわせてopen-mqa-dsdコンテナ(.mka/.mkv、旧称
+  「open-audio」)の再生・高音補正・DSD抽出の実装も反映済み(既存)。
+  **副産物のバグ修正**: この機能追加のため`open-audio-sr`をgit依存として初めて他プロジェクトから
+  使おうとしたところ、`main.rs`(HTTPサーバー)専用のRPoem/open-cpu依存(`.deps/`へのpath依存)が
+  常時必須になっておりビルドできない不具合を発見、`open-audio-sr`側Cargo.tomlを修正して`server`
+  featureへ隔離した(`open-audio-sr`のCLAUDE.mdにも記録)。`cargo test -p open-bar --lib`は
+  33件成功(ai_treble含む)。
+  **未実施**: 実機での音質検証(AI強化版の生成完了を実際に待って聴き比べる、開発機のPython import
+  遅延のため未実施)。GUI(Tauri)側にAI強化版生成中/完了の状態表示は無い(既定のリアルタイムEQで
+  常に鳴るため機能上は問題ないが、ユーザーへの見える化は次回課題)。GPU(open-cuda/open-directx)
+  推論は`open-audio-sr`側が未実装のため、ここでも当然未対応。

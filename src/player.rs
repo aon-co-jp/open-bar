@@ -970,7 +970,14 @@ impl Ctx {
         let want_dop = self.mode == PlayMode::Dop && is_dsd;
         // 排他アップサンプル(E)のDSDは、352.8kHzへ直接変換する(176.4kHz→352.8kHzの2段階変換にしない)
         let dsd_target = if self.mode == PlayMode::ExclusiveUpsample && is_dsd { Some(352_800) } else { None };
-        let mut src = match self.open_source(&path, want_dop, dsd_target) {
+        // AI高音補正(open-audio-sr): MP3かつ有効なとき、キャッシュ済みのAI強化版(48kHz WAV)が
+        // あればそれを再生する(リアルタイムEQは掛けない)。無ければ生成をバックグラウンドで始め、
+        // 今回はリアルタイムEQ(src/treble.rs)にフォールバックする(再生開始を待たせないため)。
+        let ai_enhanced = (self.treble_restore && crate::treble::is_mp3_path(&path))
+            .then(|| crate::ai_treble::try_get_or_spawn(&path))
+            .flatten();
+        let open_path = ai_enhanced.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+        let mut src = match self.open_source(&open_path, want_dop, dsd_target) {
             Ok(s) => s,
             Err(e) => {
                 set_msg(&self.shared, format!("再生できません({path}): {e}"));
@@ -1085,8 +1092,12 @@ impl Ctx {
             faded: AtomicBool::new(false),
             fade_gain: AtomicU32::new(1.0f32.to_bits()),
             dop: src.kind() == "DoP",
-            treble_restore: self.treble_restore && crate::treble::is_mp3_path(&path),
+            // AI強化版(open-audio-sr)を再生しているときは、実在の高域が既にあるのでリアルタイムEQは重ねない。
+            treble_restore: self.treble_restore && crate::treble::is_mp3_path(&path) && ai_enhanced.is_none(),
         });
+        if ai_enhanced.is_some() {
+            note.push_str("AI超解像(open-audio-sr)で高域を復元した音源を再生しています。 / Playing AI-restored audio (open-audio-sr).");
+        }
         if start_secs > 0.0 {
             let frame = ((start_secs * src.rate_hz() as f64) as u64).min(src.total_frames().saturating_sub(1));
             track.seek_src_frame.store(frame, Ordering::Release);
