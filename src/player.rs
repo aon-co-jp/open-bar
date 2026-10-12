@@ -142,6 +142,8 @@ enum Cmd {
     SetAutoVersion(bool),
     /// 高音補正(MP3向け) / Treble restoration (for MP3 sources) のON/OFF。
     SetTrebleRestore(bool),
+    /// 排他モードの出力ビット幅(24または32)。
+    SetBits(u16),
     Quit,
 }
 
@@ -264,6 +266,11 @@ impl Player {
     /// 高域(13kHz以上)を穏やかにブーストする(`src/treble.rs`)。再生中なら同じ位置から掛け直す。
     pub fn set_treble_restore(&self, on: bool) {
         let _ = self.tx.send(Cmd::SetTrebleRestore(on));
+    }
+    /// 排他モードの出力ビット幅を切り替える(24または32。既定24)。32bitを受け付けない機器は24bitへ自動で落とす。
+    /// 内部の処理はf32(仮数24bit)なので、32bitにしても実際の分解能が24bitを超えるわけではない(DACへ渡す形式が32bitになるだけ)。
+    pub fn set_bits(&self, bits: u16) {
+        let _ = self.tx.send(Cmd::SetBits(if bits >= 32 { 32 } else { 24 }));
     }
     pub fn set_volume(&self, v: f32) {
         self.volume.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
@@ -641,7 +648,14 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
                     }
                     let v = if f < take { samples.next().unwrap_or(0.0) * vol * gain } else { 0.0 };
                     let s = quantize(v, bits as u32);
-                    if bits == 16 && cbytes == 2 {
+                    if bits >= 32 {
+                        // 32bit: 4バイトコンテナへ左詰めで書く(有効24bitの機器は上位24bitだけ使う)。3バイトなら上位24bit。
+                        if cbytes == 4 {
+                            out.extend_from_slice(&s.to_le_bytes());
+                        } else {
+                            write_sample_24(out, s >> 8, cbytes);
+                        }
+                    } else if bits == 16 && cbytes == 2 {
                         out.extend_from_slice(&(s as i16).to_le_bytes());
                     } else if bits == 16 {
                         write_sample_24(out, s << 8, cbytes);
@@ -675,7 +689,7 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
 }
 
 fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume: Arc<AtomicU32>) {
-    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, treble_restore: false, shared_out: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
+    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, treble_restore: false, out_bits: 24, shared_out: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
     loop {
         let ended = shared.lock().unwrap().track.as_ref().is_some_and(|t| t.ended.load(Ordering::Acquire));
         let cmd = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -737,6 +751,9 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume
                     ctx.current = Some(i);
                     ctx.start_track(i, 0.0);
                 }
+            }
+            Cmd::SetBits(b) => {
+                ctx.out_bits = b;
             }
             Cmd::SetAutoVersion(on) => {
                 ctx.auto_version = on;
@@ -810,6 +827,8 @@ struct Ctx {
     /// 高音補正(MP3向け) / Treble restoration (for MP3 sources): ユーザーがUIのチェックボックスで
     /// 有効にしているか(実際に効くのは、かつ元がMP3のときだけ。`Track::treble_restore`参照)。
     treble_restore: bool,
+    /// 排他モードの出力ビット幅の希望(24/32)。
+    out_bits: u16,
     shared_out: Option<SharedOut>,
     src_holder: Option<Arc<dyn Source>>,
     host: cpal::Host,
@@ -993,11 +1012,21 @@ impl Ctx {
             let ch = src.channels();
             let mut found = false;
             let is_dop = src.kind() == "DoP";
-            let bits: u16 = if is_dop { 24 } else { 24 };
+            let want_bits: u16 = if is_dop { 24 } else { self.out_bits };
+            // 希望(32bit)を受け付けなければ24bitへ落とす。
+            let pick_bits = |r: u32| -> Option<u16> {
+                if crate::exclusive::probe(r, ch, want_bits).is_ok() {
+                    Some(want_bits)
+                } else if want_bits > 24 && crate::exclusive::probe(r, ch, 24).is_ok() {
+                    Some(24)
+                } else {
+                    None
+                }
+            };
             let rates = if is_dop { vec![src.rate_hz()] } else { exclusive_rates(src.rate_hz(), mode == PlayMode::ExclusiveUpsample) };
             for r in rates {
-                if crate::exclusive::probe(r, ch, bits).is_ok() {
-                    exclusive_choice = Some((r, bits));
+                if let Some(b) = pick_bits(r) {
+                    exclusive_choice = Some((r, b));
                     found = true;
                     break;
                 }
@@ -1007,8 +1036,8 @@ impl Ctx {
                 if let Ok(s) = self.open_source(&path, false, None) {
                     src = s;
                     for r in exclusive_rates(src.rate_hz(), mode == PlayMode::ExclusiveUpsample) {
-                        if crate::exclusive::probe(r, ch, bits).is_ok() {
-                            exclusive_choice = Some((r, bits));
+                        if let Some(b) = pick_bits(r) {
+                            exclusive_choice = Some((r, b));
                             found = true;
                             break;
                         }

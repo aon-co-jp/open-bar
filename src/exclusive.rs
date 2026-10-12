@@ -73,7 +73,7 @@ impl ExclusiveDevice {
         let name = device.get_friendlyname().unwrap_or_else(|_| "(名前不明)".into());
         let mut client = device.get_iaudioclient().map_err(werr)?;
         // USB DACは32bitコンテナ+有効24bitだけ受けるものが多いので、候補を順に試す。
-        let candidates: Vec<(usize, usize)> = if want_bits >= 24 { vec![(32, 24), (24, 24), (32, 32)] } else { vec![(16, 16), (32, 24), (24, 24), (32, 16)] };
+        let candidates: Vec<(usize, usize)> = if want_bits >= 32 { vec![(32, 32), (32, 24), (24, 24)] } else if want_bits >= 24 { vec![(32, 24), (24, 24), (32, 32)] } else { vec![(16, 16), (32, 24), (24, 24), (32, 16)] };
         let mut chosen = None;
         let mut last_err = String::new();
         for (container, valid) in candidates {
