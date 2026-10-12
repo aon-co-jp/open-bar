@@ -144,6 +144,8 @@ enum Cmd {
     SetTrebleRestore(bool),
     /// 排他モードの出力ビット幅(24または32)。
     SetBits(u16),
+    /// 高音補正をMP3以外(CD・ハイレゾ)にも掛けるか。
+    SetTrebleAll(bool),
     Quit,
 }
 
@@ -269,6 +271,11 @@ impl Player {
     }
     /// 排他モードの出力ビット幅を切り替える(24または32。既定24)。32bitを受け付けない機器は24bitへ自動で落とす。
     /// 内部の処理はf32(仮数24bit)なので、32bitにしても実際の分解能が24bitを超えるわけではない(DACへ渡す形式が32bitになるだけ)。
+    /// 高音補正をMP3以外(CD・ハイレゾ)にも掛ける(既定はオフ)。元の音に無い成分を足すことになるため、利用者が選んだときだけ。
+    /// AI版(AudioSR、出力48kHz)は48kHz以下の音源だけに掛け、それより高いレートの音源はレートを下げないようリアルタイムEQにする。
+    pub fn set_treble_all(&self, on: bool) {
+        let _ = self.tx.send(Cmd::SetTrebleAll(on));
+    }
     pub fn set_bits(&self, bits: u16) {
         let _ = self.tx.send(Cmd::SetBits(if bits >= 32 { 32 } else { 24 }));
     }
@@ -689,7 +696,7 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
 }
 
 fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume: Arc<AtomicU32>) {
-    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, treble_restore: false, out_bits: 24, shared_out: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
+    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, treble_restore: false, treble_all: false, out_bits: 24, shared_out: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
     loop {
         let ended = shared.lock().unwrap().track.as_ref().is_some_and(|t| t.ended.load(Ordering::Acquire));
         let cmd = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -755,6 +762,9 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume
             Cmd::SetBits(b) => {
                 ctx.out_bits = b;
             }
+            Cmd::SetTrebleAll(on) => {
+                ctx.treble_all = on;
+            }
             Cmd::SetAutoVersion(on) => {
                 ctx.auto_version = on;
                 shared.lock().unwrap().status.auto_version = on;
@@ -773,7 +783,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume
                 if playing {
                     if let Some(i) = ctx.current {
                         let (resolved_i, _) = ctx.resolve_version(i);
-                        if crate::treble::is_mp3_path(&ctx.playlist[resolved_i]) {
+                        if crate::treble::is_mp3_path(&ctx.playlist[resolved_i]) || ctx.treble_all {
                             ctx.start_track(i, pos);
                         }
                     }
@@ -829,6 +839,8 @@ struct Ctx {
     treble_restore: bool,
     /// 排他モードの出力ビット幅の希望(24/32)。
     out_bits: u16,
+    /// 高音補正をMP3以外にも掛けるか。
+    treble_all: bool,
     shared_out: Option<SharedOut>,
     src_holder: Option<Arc<dyn Source>>,
     host: cpal::Host,
@@ -992,7 +1004,10 @@ impl Ctx {
         // AI高音補正(open-audio-sr): MP3かつ有効なとき、キャッシュ済みのAI強化版(48kHz WAV)が
         // あればそれを再生する(リアルタイムEQは掛けない)。無ければ生成をバックグラウンドで始め、
         // 今回はリアルタイムEQ(src/treble.rs)にフォールバックする(再生開始を待たせないため)。
-        let ai_enhanced = (self.treble_restore && crate::treble::is_mp3_path(&path))
+        let treble_target = self.treble_restore && (crate::treble::is_mp3_path(&path) || self.treble_all);
+        // AI版は出力が48kHzなので、MP3以外では48kHz以下の音源だけに使う(ハイレゾのレートを下げない)。
+        let ai_ok = crate::treble::is_mp3_path(&path) || crate::media::probe(&path).sample_rate_hz.map_or(false, |r| r <= 48_000);
+        let ai_enhanced = (treble_target && ai_ok)
             .then(|| crate::ai_treble::try_get_or_spawn(&path))
             .flatten();
         let open_path = ai_enhanced.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
@@ -1122,7 +1137,7 @@ impl Ctx {
             fade_gain: AtomicU32::new(1.0f32.to_bits()),
             dop: src.kind() == "DoP",
             // AI強化版(open-audio-sr)を再生しているときは、実在の高域が既にあるのでリアルタイムEQは重ねない。
-            treble_restore: self.treble_restore && crate::treble::is_mp3_path(&path) && ai_enhanced.is_none(),
+            treble_restore: treble_target && ai_enhanced.is_none(),
         });
         if ai_enhanced.is_some() {
             note.push_str("AI超解像(open-audio-sr)で高域を復元した音源を再生しています。 / Playing AI-restored audio (open-audio-sr).");
