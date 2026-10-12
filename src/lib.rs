@@ -25,6 +25,8 @@ pub mod exclusive_bytes {
 }
 #[cfg(windows)]
 pub mod exclusive;
+#[cfg(windows)]
+pub mod loopback;
 pub mod media;
 pub mod mqa;
 pub mod output;

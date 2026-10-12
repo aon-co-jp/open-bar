@@ -67,9 +67,17 @@ pub struct ExclusiveDevice {
 impl ExclusiveDevice {
     /// 既定の出力デバイスを排他モードで開く(まだ再生は始めない)。
     pub fn open(rate_hz: u32, channels: usize, want_bits: u16) -> Result<ExclusiveDevice, OutputError> {
+        Self::open_on(None, rate_hz, channels, want_bits)
+    }
+
+    /// 出力デバイスを名前の一部(大文字小文字を区別しない)で指定して排他モードで開く。`None`なら既定の出力デバイス。
+    pub fn open_on(device_name: Option<&str>, rate_hz: u32, channels: usize, want_bits: u16) -> Result<ExclusiveDevice, OutputError> {
         initialize_mta().ok().map_err(werr)?;
         let enumerator = DeviceEnumerator::new().map_err(werr)?;
-        let device = enumerator.get_default_device(&Direction::Render).map_err(werr)?;
+        let device = match device_name {
+            None => enumerator.get_default_device(&Direction::Render).map_err(werr)?,
+            Some(want) => find_render_device(&enumerator, want)?,
+        };
         let name = device.get_friendlyname().unwrap_or_else(|_| "(名前不明)".into());
         let mut client = device.get_iaudioclient().map_err(werr)?;
         // USB DACは32bitコンテナ+有効24bitだけ受けるものが多いので、候補を順に試す。
@@ -139,9 +147,42 @@ impl ExclusiveDevice {
     }
 }
 
+/// 名前の一部に一致する出力デバイスを探す。
+pub fn find_render_device(enumerator: &DeviceEnumerator, want: &str) -> Result<wasapi::Device, OutputError> {
+    let want_l = want.to_lowercase();
+    for d in &enumerator.get_device_collection(&Direction::Render).map_err(werr)? {
+        let d = d.map_err(werr)?;
+        if d.get_friendlyname().map(|n| n.to_lowercase().contains(&want_l)).unwrap_or(false) {
+            return Ok(d);
+        }
+    }
+    Err(OutputError::Config(format!("出力デバイス「{want}」が見つかりません")))
+}
+
+/// 出力デバイスの名前一覧(`(名前, 既定か)`)。
+pub fn list_render_devices() -> Result<Vec<(String, bool)>, OutputError> {
+    initialize_mta().ok().map_err(werr)?;
+    let enumerator = DeviceEnumerator::new().map_err(werr)?;
+    let default = enumerator.get_default_device(&Direction::Render).ok().and_then(|d| d.get_friendlyname().ok());
+    let mut v = Vec::new();
+    for d in &enumerator.get_device_collection(&Direction::Render).map_err(werr)? {
+        let d = d.map_err(werr)?;
+        if let Ok(n) = d.get_friendlyname() {
+            let is_def = default.as_deref() == Some(n.as_str());
+            v.push((n, is_def));
+        }
+    }
+    Ok(v)
+}
+
 /// この形式で排他モードを開けるかを確かめる(実際には再生しない)。開けたらコンテナのビット幅を返す。
 pub fn probe(rate_hz: u32, channels: usize, want_bits: u16) -> Result<u16, OutputError> {
     ExclusiveDevice::open(rate_hz, channels, want_bits).map(|d| (d.container_bytes * 8) as u16)
+}
+
+/// 出力デバイスを名前で指定して、その形式で排他モードを開けるかを確かめる。
+pub fn probe_on(device_name: &str, rate_hz: u32, channels: usize, want_bits: u16) -> Result<u16, OutputError> {
+    ExclusiveDevice::open_on(Some(device_name), rate_hz, channels, want_bits).map(|d| (d.container_bytes * 8) as u16)
 }
 
 fn play_fixed<F>(rate_hz: u32, channels: usize, want_bits: u16, total_frames: u64, mut sample: F) -> Result<ExclusiveReport, OutputError>
