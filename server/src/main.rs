@@ -153,7 +153,7 @@ fn handle(mut req: Request, root: &std::path::Path, store: &Mutex<Store>) {
         if body.len() > MAX_BODY {
             json_response(413, r#"{"ok":false,"error":"too large"}"#.into())
         } else {
-            match serde_json::from_str::<Beat>(&body) {
+            match sonic_rs::from_str::<Beat>(&body) {
                 Ok(b) => match store.lock().unwrap().beat(&b, Instant::now()) {
                     Ok(()) => json_response(200, r#"{"ok":true}"#.into()),
                     Err(e) => json_response(400, format!(r#"{{"ok":false,"error":"{e}"}}"#)),
