@@ -35,7 +35,7 @@ pub fn token_from_url(url: &str) -> Option<String> {
 }
 
 pub fn load(path: &Path) -> Config {
-    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Config { token: None, enabled: true })
+    std::fs::read_to_string(path).ok().and_then(|s| sonic_rs::from_str(&s).ok()).unwrap_or(Config { token: None, enabled: true })
 }
 
 pub fn save(path: &Path, cfg: &Config) {

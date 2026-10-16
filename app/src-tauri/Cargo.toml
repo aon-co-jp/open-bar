@@ -9,6 +9,7 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+sonic-rs = "0.3"
 open-bar = { path = "../.." }
 tauri = { version = "2" }
 tauri-plugin-dialog = "2"
