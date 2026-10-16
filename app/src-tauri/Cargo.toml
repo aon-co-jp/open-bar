@@ -2,7 +2,7 @@
 name = "open-bar-app"
 version = "0.1.0"
 description = "open-bar: high-resolution audio/video player (GUI)"
-authors = ["石塚正浩（MASAHIRO ISHIZUKA）"]
+authors = ["石 塚 正 浩（MASAHIRO ISHIZUKA）"]
 edition = "2021"
 
 [build-dependencies]
