@@ -36,7 +36,7 @@ open-audio-sr = { git = "https://github.com/aon-co-jp/open-audio-sr", rev = "465
 # 音声出力(共有モード)と高品質リサンプル。`[target.windows]`のwasapiは排他モード用。
 cpal = "0.15"
 rubato = "0.15"
-thiserror = "1"
+thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sonic-rs = "0.3"
@@ -44,7 +44,7 @@ sonic-rs = "0.3"
 
 
 [target.'cfg(windows)'.dependencies]
-wasapi = "0.24"
+wasapi = "0.26"
 
 # 依存クレート(rubatoのsinc補間など)はdebugビルドでも最適化する(テストが遅すぎるため)
 [profile.dev]

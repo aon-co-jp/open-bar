@@ -59,7 +59,13 @@ pub fn device_name() -> String {
 /// 心拍を1回送る。失敗(オフライン等)は無視してよい。
 pub fn send_beat(url: &str, token: &str, state: &str, version: &str) -> Result<(), String> {
     let body = serde_json::json!({ "token": token, "device": "pc", "name": device_name(), "app_version": version, "state": state });
-    ureq::post(url).timeout(std::time::Duration::from_secs(5)).send_json(body).map(|_| ()).map_err(|e| e.to_string())
+    ureq::post(url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .build()
+        .send_json(body)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// 共有のトークン入れ物(設定ファイルと同期)。

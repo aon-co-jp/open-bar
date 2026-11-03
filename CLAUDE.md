@@ -87,3 +87,8 @@ Reading into `serde_json::Value` gives almost no speed-up even with SIMD (188 ms
 **Adoption**: in `Cargo.toml`, `rust-json = { path = "../RS-JSON", features = ["fast"] }`. Example in `RS-JSON/README.md`.
 
 **Status in this repository**: Not yet applied (policy only). Code will be switched over place by place, starting where measurements show large or frequent JSON reads.
+
+## 依存の更新(2026-11-03)
+`Cargo.lock`更新(rustls 0.23.46・rustls-webpki 0.103.16・webpki-roots 1.0.10 ほか、RUSTSEC-2026-0346〜0349・0381・0382解消)。thiserror 2、ureq 3(`tls`→`rustls`機能、`timeout`→`config().timeout_global()`)、wasapi 0.26。
+**見送り(要・別作業)**: symphonia 0.6(`core::probe`/`SampleBuffer`/`DecoderOptions`/`CODEC_TYPE_NULL`の再編)、rubato 5(`SincFixedIn`廃止)、cpal 0.18(`SampleRate`がu32別名・`build_output_stream`が値渡し・`Device::name`廃止)。音声エンジン中核の書き直しで、聴感の確認が要るため。
+`tests/real_files.rs`の実機デバイス系テストは、更新前から本機で失敗する(環境依存)。
