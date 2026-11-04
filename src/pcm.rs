@@ -98,11 +98,11 @@ fn decode_symphonia(path: &str) -> Result<Pcm, PcmError> {
     // 0.5と同じく、ギャップレス用の先頭・末尾の切り詰めはしない(サンプル数を従来と同じにする)
     let mut dec_opts = AudioDecoderOptions::default();
     dec_opts.gapless = false;
-    let (track_id, params) = format
+    let (track_id, params, delay) = format
         .tracks()
         .iter()
         .filter(|t| t.codec_params.as_ref().map_or(false, |c| c.is_audio()))
-        .find_map(|t| t.codec_params.as_ref().and_then(|c| c.audio()).filter(|a| a.sample_rate.is_some()).map(|a| (t.id, a.clone())))
+        .find_map(|t| t.codec_params.as_ref().and_then(|c| c.audio()).filter(|a| a.sample_rate.is_some()).map(|a| (t.id, a.clone(), t.delay)))
         .ok_or_else(|| PcmError::Decode("音声トラックが見つかりません".into()))?;
     let mut decoder = symphonia::default::get_codecs().make_audio_decoder(&params, &dec_opts).map_err(err)?;
     let (mut rate, mut channels) = (params.sample_rate.unwrap_or(0), params.channels.as_ref().map(|c| c.count()).unwrap_or(0));
@@ -131,6 +131,12 @@ fn decode_symphonia(path: &str) -> Result<Pcm, PcmError> {
             Err(SymError::DecodeError(_)) => continue, // 壊れたパケットは飛ばして続行
             Err(e) => return Err(err(e)),
         }
+    }
+    // Vorbisは先頭のエンコーダー遅延ぶん(典型128フレーム)を、symphonia 0.5では最初のブロックとして捨てていた。0.6はそれを出力に
+    // 含めるため、`delay`だけ先頭を捨てて0.5と同じフレーム数・同じ位置にそろえる。MP3などの`delay`は0.5でも捨てていないので触らない。
+    if params.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_VORBIS && channels > 0 {
+        let skip = (delay.unwrap_or(0) as usize * channels).min(samples.len());
+        samples.drain(..skip);
     }
     if samples.is_empty() || rate == 0 || channels == 0 {
         return Err(PcmError::Decode("デコード結果が空です".into()));

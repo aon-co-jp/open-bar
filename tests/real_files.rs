@@ -305,3 +305,21 @@ fn upsample_filters_run_faster_than_real_time() {
         }
     }
 }
+
+/// symphonia 0.6ではVorbisの先頭にエンコーダー遅延(128フレーム)が余分に出ていた。0.5と同じフレーム数・同じ位置に保つ回帰テスト。
+#[test]
+fn vorbis_decode_has_the_same_frame_count_and_start_as_before() {
+    if !ffmpeg_ok() {
+        return;
+    }
+    let dir = tmpdir("vorbis_len");
+    let path = make(&dir, "v.ogg", &["-c:a", "libvorbis"]);
+    let p = pcm::decode_file(&path).unwrap();
+    let frames = p.samples.len() / p.channels;
+    // 2秒・48kHz = 96000フレーム。Vorbisは末尾に最大1ブロック(2048)ほどの端数が付くが、先頭の余分(+128)は無い。
+    assert!((96_000..96_000 + 2048).contains(&frames), "frames={frames}");
+    // 先頭は正弦波(1kHz, 位相0)の立ち上がり: 先頭128フレームがほぼ無音の助走ではなく、すぐ振幅が出る
+    let head = p.samples[..128 * p.channels].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(head > 0.3, "先頭に無音の助走が付いている: {head}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
