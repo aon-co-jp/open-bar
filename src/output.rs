@@ -5,7 +5,8 @@
 use crate::pcm::Pcm;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::audioadapter_buffers::{direct::InterleavedSlice, owned::InterleavedOwned};
+use rubato::{Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -64,12 +65,52 @@ pub enum ResampleFilter {
 
 pub fn sinc_params(f: ResampleFilter) -> SincInterpolationParameters {
     match f {
-        ResampleFilter::Standard => SincInterpolationParameters { sinc_len: 256, f_cutoff: 0.95, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 },
+        ResampleFilter::Standard => SincInterpolationParameters { sinc_len: 256, f_cutoff: Some(0.95), interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 },
         // 1024タップ・512倍オーバーサンプルは重すぎて実時間に間に合わず、音切れの原因になった(実機の聴取で判明)ため、512タップにした
-        ResampleFilter::Sharp => SincInterpolationParameters { sinc_len: 512, f_cutoff: 0.99, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 },
-        ResampleFilter::Custom(pct) => SincInterpolationParameters { sinc_len: 256, f_cutoff: (pct.clamp(80, 99) as f32) / 100.0, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 },
-        ResampleFilter::Soft => SincInterpolationParameters { sinc_len: 256, f_cutoff: 0.90, interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::Blackman2 },
+        ResampleFilter::Sharp => SincInterpolationParameters { sinc_len: 512, f_cutoff: Some(0.99), interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 },
+        ResampleFilter::Custom(pct) => SincInterpolationParameters { sinc_len: 256, f_cutoff: Some((pct.clamp(80, 99) as f32) / 100.0), interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::BlackmanHarris2 },
+        ResampleFilter::Soft => SincInterpolationParameters { sinc_len: 256, f_cutoff: Some(0.90), interpolation: SincInterpolationType::Cubic, oversampling_factor: 256, window: WindowFunction::Blackman2 },
     }
+}
+
+/// rubato 5のsinc変換器(入力フレーム数固定)。`SincFixedIn`(rubato 0.15)と同じ引数・同じ補間で、補間結果のサンプル値は
+/// 0.15と一致する(実測、差は1e-6未満)。0.15は出力の先頭がフィルター遅延の分だけ詰まっていたが、5では遅延ぶんの無音が
+/// 先頭に付くので、同じ位置に揃えるため先頭の`skip`フレームを捨てる。
+pub struct SincStream {
+    pub rs: Async<f32>,
+    skip: usize,
+}
+
+pub fn new_sinc(ratio: f64, max_relative: f64, params: &SincInterpolationParameters, chunk: usize, channels: usize) -> Result<SincStream, OutputError> {
+    let rs = Async::<f32>::new_sinc(ratio, max_relative, params, chunk, channels, FixedAsync::Input).map_err(|e| OutputError::Resample(e.to_string()))?;
+    let skip = (((params.sinc_len / 2).saturating_sub(1)) as f64 * ratio).round() as usize;
+    Ok(SincStream { rs, skip })
+}
+
+/// インターリーブ入力`input`(`frames`フレーム)を1回ぶん変換し、インターリーブで返す。
+/// `frames`が変換器の要求(`input_frames_next`)より少なければ、足りない分は無音として扱う(旧`process_partial`と同じ)。
+pub fn sinc_process(st: &mut SincStream, input: &[f32], channels: usize, frames: usize) -> Result<Vec<f32>, OutputError> {
+    let rs = &mut st.rs;
+    let need = rs.input_frames_next();
+    let mut padded;
+    let src: &[f32] = if frames < need {
+        padded = input[..frames * channels].to_vec();
+        padded.resize(need * channels, 0.0);
+        &padded
+    } else {
+        input
+    };
+    let e = |e: &dyn std::fmt::Display| OutputError::Resample(e.to_string());
+    let ibuf = InterleavedSlice::new(src, channels, src.len() / channels).map_err(|x| e(&x))?;
+    let mut obuf = InterleavedOwned::<f32>::new(0.0, channels, rs.output_frames_max());
+    let idx = Indexing { input_offset: 0, output_offset: 0, partial_len: if frames < need { Some(frames) } else { None }, active_channels_mask: None };
+    let (_, nout) = rs.process_into_buffer(&ibuf, &mut obuf, Some(&idx)).map_err(|x| e(&x))?;
+    let mut v = obuf.take_data();
+    v.truncate(nout * channels);
+    let drop_frames = st.skip.min(nout);
+    st.skip -= drop_frames;
+    v.drain(..drop_frames * channels);
+    Ok(v)
 }
 
 /// 整数倍アップサンプル用のポリフェーズ設計(位相あたりタップ数M、元のナイキストに対するカットオフ)。フィルターの種類ごと。
@@ -128,34 +169,19 @@ pub fn resample_with(samples: &[f32], channels: usize, from: u32, to: u32, filte
     let frames = samples.len() / channels;
     let params = sinc_params(filter);
     let chunk = 2048usize;
-    let mut rs = SincFixedIn::<f32>::new(to as f64 / from as f64, 2.0, params, chunk, channels).map_err(|e| OutputError::Resample(e.to_string()))?;
-    let planar: Vec<Vec<f32>> = (0..channels).map(|c| samples.iter().skip(c).step_by(channels).copied().collect()).collect();
-    let mut out: Vec<Vec<f32>> = vec![Vec::new(); channels];
+    let mut rs = new_sinc(to as f64 / from as f64, 2.0, &params, chunk, channels)?;
+    let mut inter: Vec<f32> = Vec::new();
     let mut pos = 0;
     while pos + chunk <= frames {
-        let block: Vec<&[f32]> = planar.iter().map(|c| &c[pos..pos + chunk]).collect();
-        let r = rs.process(&block, None).map_err(|e| OutputError::Resample(e.to_string()))?;
-        for (o, c) in out.iter_mut().zip(r) {
-            o.extend(c);
-        }
+        inter.extend(sinc_process(&mut rs, &samples[pos * channels..(pos + chunk) * channels], channels, chunk)?);
         pos += chunk;
     }
     if pos < frames {
-        let block: Vec<&[f32]> = planar.iter().map(|c| &c[pos..]).collect();
-        let r = rs.process_partial(Some(&block), None).map_err(|e| OutputError::Resample(e.to_string()))?;
-        for (o, c) in out.iter_mut().zip(r) {
-            o.extend(c);
-        }
+        inter.extend(sinc_process(&mut rs, &samples[pos * channels..frames * channels], channels, frames - pos)?);
     }
     // フィルタの遅延分の末尾が残るので、理論長に切り詰める
     let want = (frames as f64 * to as f64 / from as f64).round() as usize;
-    let n = out[0].len().min(want.max(1));
-    let mut inter = Vec::with_capacity(n * channels);
-    for i in 0..n {
-        for c in &out {
-            inter.push(c[i]);
-        }
-    }
+    inter.truncate((inter.len() / channels).min(want.max(1)) * channels);
     Ok(inter)
 }
 
@@ -188,7 +214,7 @@ where
     let (pos_cb, done_cb, data_cb) = (pos.clone(), done.clone(), data.clone());
     let stream = device
         .build_output_stream(
-            config,
+            config.clone(),
             move |out: &mut [T], _| {
                 let start = pos_cb.load(Ordering::Relaxed) as usize;
                 let n = out.len() / ch;
@@ -212,7 +238,7 @@ where
     stream.play().map_err(|e| OutputError::Stream(e.to_string()))?;
     while !done.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(10));
-        if t0.elapsed().as_secs_f64() > total_frames as f64 / config.sample_rate.0 as f64 + 5.0 {
+        if t0.elapsed().as_secs_f64() > total_frames as f64 / config.sample_rate as f64 + 5.0 {
             return Err(OutputError::Stream("デバイスがデータを消費しません(タイムアウト)".into()));
         }
     }
@@ -225,15 +251,15 @@ where
 pub fn play_blocking(pcm: &Pcm, opts: &PlayOpts) -> Result<PlayReport, OutputError> {
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or(OutputError::NoDevice)?;
-    let name = device.name().unwrap_or_else(|_| "(名前不明)".into());
+    let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "(名前不明)".into());
     let default = device.default_output_config().map_err(|e| OutputError::Config(e.to_string()))?;
     let dev_ch = default.channels();
     // 元のサンプルレートをそのまま受け付けるデバイス設定があればそれを使い、無ければ既定のレートへ変換する。
     let native_ok = device
         .supported_output_configs()
         .map_err(|e| OutputError::Config(e.to_string()))?
-        .any(|c| c.channels() == dev_ch && c.min_sample_rate().0 <= pcm.sample_rate && pcm.sample_rate <= c.max_sample_rate().0 && c.sample_format() == default.sample_format());
-    let dev_rate = if native_ok { pcm.sample_rate } else { default.sample_rate().0 };
+        .any(|c| c.channels() == dev_ch && c.min_sample_rate() <= pcm.sample_rate && pcm.sample_rate <= c.max_sample_rate() && c.sample_format() == default.sample_format());
+    let dev_rate = if native_ok { pcm.sample_rate } else { default.sample_rate() };
     let mut samples = pcm.samples.clone();
     if let Some(max) = opts.max_seconds {
         let keep = (max * pcm.sample_rate as f64) as usize * pcm.channels;
@@ -246,7 +272,7 @@ pub fn play_blocking(pcm: &Pcm, opts: &PlayOpts) -> Result<PlayReport, OutputErr
     let samples = resample(&samples, pcm.channels, pcm.sample_rate, dev_rate)?;
     let samples = map_channels(&samples, pcm.channels, dev_ch as usize);
     let total = (samples.len() / dev_ch as usize) as u64;
-    let config = StreamConfig { channels: dev_ch, sample_rate: cpal::SampleRate(dev_rate), buffer_size: cpal::BufferSize::Default };
+    let config = StreamConfig { channels: dev_ch, sample_rate: dev_rate, buffer_size: cpal::BufferSize::Default };
     let data = Arc::new(samples);
     let (frames, elapsed) = match default.sample_format() {
         SampleFormat::F32 => run_stream::<f32>(&device, &config, data, total, dev_ch as usize)?,

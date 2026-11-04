@@ -5,7 +5,7 @@ use std::fs::File;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::formats::probe::Hint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,15 +97,14 @@ pub fn probe(path: &str) -> MediaInfo {
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
         hint.with_extension(&ext);
-        if let Ok(p) = symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default()) {
-            if let Some(t) = p.format.tracks().iter().find(|t| t.codec_params.sample_rate.is_some()) {
-                let cp = &t.codec_params;
+        if let Ok(format) = symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default()) {
+            let found = format.tracks().iter().find_map(|t| t.codec_params.as_ref().and_then(|c| c.audio()).filter(|a| a.sample_rate.is_some()).map(|a| (t, a)));
+            if let Some((t, cp)) = found {
                 info.sample_rate_hz = cp.sample_rate;
-                info.channels = cp.channels.map(|c| c.count());
+                info.channels = cp.channels.as_ref().map(|c| c.count());
                 info.bits_per_sample = cp.bits_per_sample;
-                if let (Some(tb), Some(n)) = (cp.time_base, cp.n_frames) {
-                    let t = tb.calc_time(n);
-                    info.duration_secs = Some(t.seconds as f64 + t.frac);
+                if let (Some(rate), Some(n)) = (cp.sample_rate, t.num_frames) {
+                    info.duration_secs = Some(n as f64 / rate as f64);
                 }
             }
         }

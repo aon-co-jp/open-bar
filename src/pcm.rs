@@ -2,13 +2,12 @@
 //! サンプルはインターリーブしたf32(24bitまで厳密。32bit整数は精度が落ちる点に注意)。
 
 use std::fs::File;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::formats::probe::Hint;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -95,35 +94,39 @@ fn decode_symphonia(path: &str) -> Result<Pcm, PcmError> {
     if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
-    let probed = symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default()).map_err(err)?;
-    let mut format = probed.format;
-    let track = format
+    let mut format = symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default()).map_err(err)?;
+    // 0.5と同じく、ギャップレス用の先頭・末尾の切り詰めはしない(サンプル数を従来と同じにする)
+    let mut dec_opts = AudioDecoderOptions::default();
+    dec_opts.gapless = false;
+    let (track_id, params) = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())
-        .ok_or_else(|| PcmError::Decode("音声トラックが見つかりません".into()))?
-        .clone();
-    let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default()).map_err(err)?;
-    let (mut rate, mut channels) = (track.codec_params.sample_rate.unwrap_or(0), track.codec_params.channels.map(|c| c.count()).unwrap_or(0));
+        .filter(|t| t.codec_params.as_ref().map_or(false, |c| c.is_audio()))
+        .find_map(|t| t.codec_params.as_ref().and_then(|c| c.audio()).filter(|a| a.sample_rate.is_some()).map(|a| (t.id, a.clone())))
+        .ok_or_else(|| PcmError::Decode("音声トラックが見つかりません".into()))?;
+    let mut decoder = symphonia::default::get_codecs().make_audio_decoder(&params, &dec_opts).map_err(err)?;
+    let (mut rate, mut channels) = (params.sample_rate.unwrap_or(0), params.channels.as_ref().map(|c| c.count()).unwrap_or(0));
     let mut samples: Vec<f32> = Vec::new();
+    let mut tmp: Vec<f32> = Vec::new();
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => break,
             Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(SymError::ResetRequired) => break,
             Err(e) => return Err(err(e)),
         };
-        if packet.track_id() != track.id {
+        if packet.track_id != track_id {
             continue;
         }
         match decoder.decode(&packet) {
             Ok(buf) => {
-                let spec = *buf.spec();
-                rate = spec.rate;
-                channels = spec.channels.count();
-                let mut sb = SampleBuffer::<f32>::new(buf.capacity() as u64, spec);
-                sb.copy_interleaved_ref(buf);
-                samples.extend_from_slice(sb.samples());
+                let spec = buf.spec();
+                rate = spec.rate();
+                channels = spec.channels().count();
+                tmp.resize(buf.samples_interleaved(), 0.0);
+                buf.copy_to_slice_interleaved(&mut tmp);
+                samples.extend_from_slice(&tmp);
             }
             Err(SymError::DecodeError(_)) => continue, // 壊れたパケットは飛ばして続行
             Err(e) => return Err(err(e)),
@@ -132,5 +135,5 @@ fn decode_symphonia(path: &str) -> Result<Pcm, PcmError> {
     if samples.is_empty() || rate == 0 || channels == 0 {
         return Err(PcmError::Decode("デコード結果が空です".into()));
     }
-    Ok(Pcm { sample_rate: rate, channels, samples, bits_per_sample: track.codec_params.bits_per_sample })
+    Ok(Pcm { sample_rate: rate, channels, samples, bits_per_sample: params.bits_per_sample })
 }

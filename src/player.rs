@@ -18,7 +18,6 @@ use crate::pcm::decode_file;
 use crate::source::{DopSource, DsdPcmSource, PcmSource, Source};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
-use rubato::{Resampler, SincFixedIn};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -334,7 +333,7 @@ const CHUNK: usize = 2048;
 /// 変換器: 整数倍ならポリフェーズ(高速)、そうでなければ汎用のsinc補間(rubato)。
 enum Rs {
     None,
-    Sinc(Box<SincFixedIn<f32>>),
+    Sinc(Box<crate::output::SincStream>),
     Poly(Vec<Upsampler>),
 }
 
@@ -346,7 +345,7 @@ fn make_resampler(from: u32, to: u32, ch: usize, filter: ResampleFilter) -> Rs {
         let (m, cutoff) = poly_design(filter);
         return Rs::Poly((0..ch).map(|_| Upsampler::new(l, m, cutoff, 9.0)).collect());
     }
-    match SincFixedIn::<f32>::new(to as f64 / from as f64, 2.0, sinc_params(filter), CHUNK, ch) {
+    match crate::output::new_sinc(to as f64 / from as f64, 2.0, &sinc_params(filter), CHUNK, ch) {
         Ok(r) => Rs::Sinc(Box::new(r)),
         Err(_) => Rs::None,
     }
@@ -435,20 +434,8 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
                 map_channels_pub(&inter, ch, track.out_ch)
             }
             Rs::Sinc(r) => {
-                let planar: Vec<Vec<f32>> = (0..ch).map(|c| block.iter().skip(c).step_by(ch).copied().collect()).collect();
-                let refs: Vec<&[f32]> = planar.iter().map(|v| v.as_slice()).collect();
-                let res = if n == CHUNK { r.process(&refs, None) } else { r.process_partial(Some(&refs), None) };
-                match res {
-                    Ok(o) => {
-                        let frames = o[0].len();
-                        let mut inter = Vec::with_capacity(frames * ch);
-                        for i in 0..frames {
-                            for c in &o {
-                                inter.push(c[i]);
-                            }
-                        }
-                        map_channels_pub(&inter, ch, track.out_ch)
-                    }
+                match crate::output::sinc_process(r, &block, ch, n) {
+                    Ok(inter) => map_channels_pub(&inter, ch, track.out_ch),
                     Err(_) => Vec::new(),
                 }
             }
@@ -522,7 +509,7 @@ where
 {
     device
         .build_output_stream(
-            config,
+            config.clone(),
             move |out: &mut [T], _| {
                 let n = out.len() / ch;
                 let silent = |out: &mut [T]| out.iter_mut().for_each(|o| *o = T::from_sample(0.0));
@@ -1100,7 +1087,7 @@ impl Ctx {
                     return;
                 }
             };
-            (default.sample_rate().0, default.channels() as usize, device.name().unwrap_or_default(), Some(default.sample_format()), Some(device))
+            (default.sample_rate(), default.channels() as usize, device.description().map(|d| d.name().to_string()).unwrap_or_default(), Some(default.sample_format()), Some(device))
         };
         // 変換が実時間に間に合わないフィルター(重いシャープなど)は、音切れの原因になるので標準へ落とす。
         let mut effective_filter = self.filter;
@@ -1164,7 +1151,7 @@ impl Ctx {
             if !reuse {
                 self.shared_out = None;
                 let slot: Slot = Arc::new(Mutex::new(None));
-                let config = StreamConfig { channels: out_ch as u16, sample_rate: cpal::SampleRate(out_rate), buffer_size: cpal::BufferSize::Default };
+                let config = StreamConfig { channels: out_ch as u16, sample_rate: out_rate, buffer_size: cpal::BufferSize::Default };
                 let built = match fmt {
                     SampleFormat::F32 => build_cpal::<f32>(&device, &config, slot.clone(), out_ch, self.volume.clone()),
                     SampleFormat::I16 => build_cpal::<i16>(&device, &config, slot.clone(), out_ch, self.volume.clone()),

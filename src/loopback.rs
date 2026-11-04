@@ -13,7 +13,8 @@
 
 use crate::exclusive::{find_render_device, list_render_devices, quantize, write_sample_24, ExclusiveDevice};
 use crate::output::OutputError;
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use crate::output::{new_sinc, sinc_process};
+use rubato::{Adjustable, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -222,13 +223,13 @@ fn render_loop(
     status.lock().unwrap().container_bits = (dev.container_bytes * 8) as u16;
     let params = SincInterpolationParameters {
         sinc_len: 256,
-        f_cutoff: 0.95,
+        f_cutoff: Some(0.95),
         interpolation: SincInterpolationType::Linear,
         oversampling_factor: 256,
         window: WindowFunction::Blackman2,
     };
     let base_ratio = out_rate as f64 / in_rate as f64;
-    let mut rs = SincFixedIn::<f32>::new(base_ratio, 1.05, params, CHUNK, CH).map_err(|e| OutputError::Resample(e.to_string()))?;
+    let mut rs = new_sinc(base_ratio, 1.05, &params, CHUNK, CH)?;
     let target = (TARGET_SECS * in_rate as f64) as usize * CH;
     let mut primed = false;
     let mut out_q: VecDeque<f32> = VecDeque::new();
@@ -254,14 +255,9 @@ fn render_loop(
                     // バッファが目標より多ければ少し速く消費(比を下げる)、少なければ遅く(比を上げる)。±0.2%まで。
                     let err = (have as f64 - target as f64) / target as f64;
                     let rel = (1.0 - err * 0.002).clamp(0.998, 1.002);
-                    let _ = rs.set_resample_ratio_relative(rel, true);
-                    let planar: Vec<Vec<f32>> = (0..CH).map(|ch| c.iter().skip(ch).step_by(CH).copied().collect()).collect();
-                    if let Ok(o) = rs.process(&planar, None) {
-                        for i in 0..o[0].len() {
-                            for ch in &o {
-                                out_q.push_back(ch[i]);
-                            }
-                        }
+                    let _ = rs.rs.set_resample_ratio_relative(rel, true);
+                    if let Ok(o) = sinc_process(&mut rs, &c, CH, CHUNK) {
+                        out_q.extend(o);
                     }
                 }
                 None => {

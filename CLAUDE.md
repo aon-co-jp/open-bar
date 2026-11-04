@@ -90,5 +90,7 @@ Reading into `serde_json::Value` gives almost no speed-up even with SIMD (188 ms
 
 ## 依存の更新(2026-11-03)
 `Cargo.lock`更新(rustls 0.23.46・rustls-webpki 0.103.16・webpki-roots 1.0.10 ほか、RUSTSEC-2026-0346〜0349・0381・0382解消)。thiserror 2、ureq 3(`tls`→`rustls`機能、`timeout`→`config().timeout_global()`)、wasapi 0.26。
-**見送り(要・別作業)**: symphonia 0.6(`core::probe`/`SampleBuffer`/`DecoderOptions`/`CODEC_TYPE_NULL`の再編)、rubato 5(`SincFixedIn`廃止)、cpal 0.18(`SampleRate`がu32別名・`build_output_stream`が値渡し・`Device::name`廃止)。音声エンジン中核の書き直しで、聴感の確認が要るため。
-`tests/real_files.rs`の実機デバイス系テストは、更新前から本機で失敗する(環境依存)。
+**2026-11-04 続き**: 見送っていた3つも更新(symphonia 0.6.1・rubato 5.0・cpal 0.18)。`output.rs`に`new_sinc`/`sinc_process`(`SincFixedIn`相当のラッパー)を置き、`player.rs`・`loopback.rs`もそれを使う。symphonia 0.6はprobe/`AudioDecoderOptions`/`copy_to_slice_interleaved`へ、cpalは`description().name()`・`build_output_stream`の値渡し・`SampleRate`=u32へ書き換え。
+**音質を変えていない根拠**: sinc長・窓・補間・f_cutoff(`Some(..)`)・ビット深度・排他モードは従来のまま。デコードは`gapless=false`でサンプル数を0.5と同じにした(0.6の既定はtrue)。同じ合成音で変更前後のリサンプル出力を比較: 整数倍(44.1→88.2/176.4/352.8k、全フィルター)は最大差 3.9e-7(浮動小数点の誤差)。**非整数倍(44.1→48/96/32k)は最大差0.02〜0.10**: rubato 5は出力先頭にフィルター遅延ぶんの無音が付くため、先頭の`(sinc_len/2-1)*ratio`フレームを丸めて捨てて0.15の位置に揃えており、端数(最大0.5出力フレーム)の位相が違う(ノイズ入りの合成音での差。聴感は未確認)。
+**未確認**: 聴感(実機で聴き比べていない)、デコードの前後比較(実音源での0.5↔0.6のサンプル比較は未実施。既存のE2Eテストは通過)、macOS。
+テスト: Windows/Linux(WSL)とも単体・E2Eの結果は更新前と同一(`tests/real_files.rs`の実機デバイス系はWindowsで2件、WSLで3件、`presence`の実サーバーテスト(WSL)が環境依存で失敗するのも更新前から同じ)。
