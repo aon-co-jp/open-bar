@@ -154,7 +154,14 @@ struct Track {
     paused: AtomicBool,
     ended: AtomicBool,
     /// 生産スレッド・出力スレッドの停止要求(トラック終了・停止・切り替え時)。
-    stop: AtomicBool,
+    /// 出力スレッドも見る停止フラグ。ギャップレスでつながったトラックどうしは同じものを共有する。
+    stop: Arc<AtomicBool>,
+    /// このトラックの生産スレッドだけを止める(ギャップレスで次のトラックへ引き継いだ後、メモリを解放するため)。
+    retired: AtomicBool,
+    /// 出力側が、このトラックを最後まで鳴らして`next`へ切り替えた(隙間なし)。
+    handed_off: AtomicBool,
+    /// ギャップレスで次に鳴らす、準備済みのトラック(同じ出力形式のときだけ)。
+    next: Mutex<Option<Arc<Track>>>,
     producer_done: AtomicBool,
     /// シークの世代番号。増えたら生産側はリサンプラを作り直して`seek_src_frame`から再開する。
     seek_gen: AtomicU64,
@@ -366,7 +373,7 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
     let fade_frames = (FADE_SECS * track.out_rate as f64) as usize;
     let mut fade_left = if track.dop { 0 } else { fade_frames }; // 開始・シーク直後はなめらかに立ち上げる(波形の途中から始まるとクリック音になる)
     loop {
-        if track.stop.load(Ordering::Relaxed) {
+        if track.stop.load(Ordering::Relaxed) || track.retired.load(Ordering::Relaxed) {
             return;
         }
         let g = track.seek_gen.load(Ordering::Acquire);
@@ -491,6 +498,22 @@ fn extract_open_audio_dsd(path: &str) -> Result<Option<std::path::PathBuf>, Stri
 // ---- 出力バックエンド ----
 
 /// 現在再生中のトラック(なければ無音)。共有モードの出力ストリームは開きっぱなしで、ここを差し替えて曲やモードを切り替える。
+/// 現在のトラックのリングを使い切ったあと、続きを次のトラックのリングから(隙間なく)`frames`フレームまで取る。
+/// `cur`が尽きて`next`があるときだけ`next`から足す。戻り値は(`cur`から取ったフレーム数, `next`から取ったフレーム数)で、
+/// `out`にはその順に並ぶ。純粋関数(単体テストできる)。
+pub fn take_across(cur: &mut VecDeque<f32>, next: Option<&mut VecDeque<f32>>, frames: usize, ch: usize, out: &mut Vec<f32>) -> (usize, usize) {
+    let a = frames.min(cur.len() / ch);
+    out.extend(cur.drain(..a * ch));
+    let mut b = 0;
+    if a < frames && cur.is_empty() {
+        if let Some(nx) = next {
+            b = (frames - a).min(nx.len() / ch);
+            out.extend(nx.drain(..b * ch));
+        }
+    }
+    (a, b)
+}
+
 type Slot = Arc<Mutex<Option<Arc<Track>>>>;
 
 /// 開きっぱなしの共有モード出力。曲の切り替え・停止のたびにデバイスを開閉すると、DAC側でミュート解除のノイズ(プツッ)が出るため、
@@ -503,6 +526,107 @@ struct SharedOut {
     name: String,
 }
 
+/// 共有モードの出力コールバックの中身(テストできるよう関数に分けた)。
+fn fill_shared<T>(slot: &Slot, volume: &AtomicU32, ch: usize, out: &mut [T])
+where
+    T: SizedSample + FromSample<f32>,
+{
+        let n = out.len() / ch;
+        let silent = |out: &mut [T]| out.iter_mut().for_each(|o| *o = T::from_sample(0.0));
+        // 再生中のトラックを取得(差し替え中のごく短い間は無音)
+        let track = match slot.try_lock() {
+            Ok(g) => g.clone(),
+            Err(_) => {
+                silent(out);
+                return;
+            }
+        };
+        let Some(track) = track else {
+            silent(out);
+            return;
+        };
+        if track.paused.load(Ordering::Relaxed) {
+            silent(out);
+            return;
+        }
+        let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+        // 生産側はここを一瞬(extend/clearのみ)しか持たない。以前はtry_lockで即座に諦めて無音を
+        // 差し込んでおり、それが波形の不連続=クリック音の原因だった(バグ報告: 標準モードで再生
+        // 開始から少し経って一瞬ノイズ)。とはいえリアルタイムの出力コールバックを無条件に
+        // ブロックするのも避けたい(何らかの理由で生産側が長く持ったままだと音切れの原因になる)ため、
+        // ごく短時間だけスピンして待ち、それでも取れなければ音切れを選ぶ(無限待ちにはしない)。
+        let mut ring = match { let mut r = track.ring.try_lock(); for _ in 0..64 { if r.is_ok() { break; } std::hint::spin_loop(); r = track.ring.try_lock(); } r } {
+            Ok(r) => r,
+            Err(_) => {
+                silent(out);
+                return;
+            }
+        };
+        let avail = ring.len() / ch;
+        if !track.primed.load(Ordering::Acquire) {
+            if avail as f64 >= PRIME_SECS * track.out_rate as f64 || track.producer_done.load(Ordering::Acquire) {
+                track.primed.store(true, Ordering::Release);
+            } else {
+                silent(out); // 先読みが溜まるまで待つ(開始直後・シーク直後の音切れを防ぐ)
+                return;
+            }
+        }
+        let take = n.min(avail);
+        let fading = track.fadeout.load(Ordering::Relaxed);
+        let step = 1.0 / (FADE_SECS * track.out_rate as f64) as f32;
+        let mut gain = f32::from_bits(track.fade_gain.load(Ordering::Relaxed));
+        for (i, (o, v)) in out.iter_mut().zip(ring.drain(..take * ch)).enumerate() {
+            if fading && i % ch == 0 && gain > 0.0 {
+                gain = (gain - step).max(0.0);
+            }
+            *o = T::from_sample(v * vol * gain);
+        }
+        if fading {
+            track.fade_gain.store(gain.to_bits(), Ordering::Relaxed);
+            if gain <= 0.0 {
+                track.faded.store(true, Ordering::Release);
+            }
+        }
+        // 曲の終わり: 準備済みの次のトラックがあれば、同じコールバックの中で続きを鳴らす(ギャップレス)
+        let mut take = take;
+        if take < n && ring.is_empty() && track.producer_done.load(Ordering::Acquire) {
+            if let Ok(mut nx) = track.next.try_lock() {
+                if let Some(nt) = nx.take() {
+                    let switched = slot.try_lock().map(|mut s| *s = Some(nt.clone())).is_ok();
+                    if switched {
+                        nt.primed.store(true, Ordering::Release);
+                        track.handed_off.store(true, Ordering::Release);
+                        if let Ok(mut r2) = nt.ring.try_lock() {
+                            let mut tail = Vec::new();
+                            let (_, b) = take_across(&mut VecDeque::new(), Some(&mut r2), n - take, ch, &mut tail);
+                            for (o, v) in out[take * ch..].iter_mut().zip(tail) {
+                                *o = T::from_sample(v * vol);
+                            }
+                            nt.consumed.fetch_add(b as u64, Ordering::Relaxed);
+                            take += b;
+                        }
+                        for o in out[take * ch..].iter_mut() {
+                            *o = T::from_sample(0.0);
+                        }
+                        return;
+                    }
+                    *nx = Some(nt); // 差し替えに失敗: 次回のコールバックでやり直す
+                }
+            }
+        }
+        for o in out[take * ch..].iter_mut() {
+            *o = T::from_sample(0.0);
+        }
+        track.consumed.fetch_add(take as u64, Ordering::Relaxed);
+        if take < n {
+            if ring.is_empty() && track.producer_done.load(Ordering::Acquire) {
+                track.ended.store(true, Ordering::Release);
+            } else {
+                track.underrun_frames.fetch_add((n - take) as u64, Ordering::Relaxed);
+            }
+        }
+}
+
 fn build_cpal<T>(device: &cpal::Device, config: &StreamConfig, slot: Slot, ch: usize, volume: Arc<AtomicU32>) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32> + Send + 'static,
@@ -510,75 +634,7 @@ where
     device
         .build_output_stream(
             config.clone(),
-            move |out: &mut [T], _| {
-                let n = out.len() / ch;
-                let silent = |out: &mut [T]| out.iter_mut().for_each(|o| *o = T::from_sample(0.0));
-                // 再生中のトラックを取得(差し替え中のごく短い間は無音)
-                let track = match slot.try_lock() {
-                    Ok(g) => g.clone(),
-                    Err(_) => {
-                        silent(out);
-                        return;
-                    }
-                };
-                let Some(track) = track else {
-                    silent(out);
-                    return;
-                };
-                if track.paused.load(Ordering::Relaxed) {
-                    silent(out);
-                    return;
-                }
-                let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                // 生産側はここを一瞬(extend/clearのみ)しか持たない。以前はtry_lockで即座に諦めて無音を
-                // 差し込んでおり、それが波形の不連続=クリック音の原因だった(バグ報告: 標準モードで再生
-                // 開始から少し経って一瞬ノイズ)。とはいえリアルタイムの出力コールバックを無条件に
-                // ブロックするのも避けたい(何らかの理由で生産側が長く持ったままだと音切れの原因になる)ため、
-                // ごく短時間だけスピンして待ち、それでも取れなければ音切れを選ぶ(無限待ちにはしない)。
-                let mut ring = match { let mut r = track.ring.try_lock(); for _ in 0..64 { if r.is_ok() { break; } std::hint::spin_loop(); r = track.ring.try_lock(); } r } {
-                    Ok(r) => r,
-                    Err(_) => {
-                        silent(out);
-                        return;
-                    }
-                };
-                let avail = ring.len() / ch;
-                if !track.primed.load(Ordering::Acquire) {
-                    if avail as f64 >= PRIME_SECS * track.out_rate as f64 || track.producer_done.load(Ordering::Acquire) {
-                        track.primed.store(true, Ordering::Release);
-                    } else {
-                        silent(out); // 先読みが溜まるまで待つ(開始直後・シーク直後の音切れを防ぐ)
-                        return;
-                    }
-                }
-                let take = n.min(avail);
-                let fading = track.fadeout.load(Ordering::Relaxed);
-                let step = 1.0 / (FADE_SECS * track.out_rate as f64) as f32;
-                let mut gain = f32::from_bits(track.fade_gain.load(Ordering::Relaxed));
-                for (i, (o, v)) in out.iter_mut().zip(ring.drain(..take * ch)).enumerate() {
-                    if fading && i % ch == 0 && gain > 0.0 {
-                        gain = (gain - step).max(0.0);
-                    }
-                    *o = T::from_sample(v * vol * gain);
-                }
-                if fading {
-                    track.fade_gain.store(gain.to_bits(), Ordering::Relaxed);
-                    if gain <= 0.0 {
-                        track.faded.store(true, Ordering::Release);
-                    }
-                }
-                for o in out[take * ch..].iter_mut() {
-                    *o = T::from_sample(0.0);
-                }
-                track.consumed.fetch_add(take as u64, Ordering::Relaxed);
-                if take < n {
-                    if ring.is_empty() && track.producer_done.load(Ordering::Acquire) {
-                        track.ended.store(true, Ordering::Release);
-                    } else {
-                        track.underrun_frames.fetch_add((n - take) as u64, Ordering::Relaxed);
-                    }
-                }
-            },
+            move |out: &mut [T], _| fill_shared(&slot, &volume, ch, out),
             |e| eprintln!("出力ストリームのエラー: {e}"),
             None,
         )
@@ -615,32 +671,53 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
             return;
         }
     };
+    let mut track = track;
+    let stop = track.stop.clone();
     let ch = track.out_ch;
     let mut marker_even = true; // DoPのマーカー位相(全チャンネル共通、フレームごとに反転)
-    let r = dev.run(&track.stop, |n, cbytes, chn, out| {
+    let r = dev.run(&stop, |n, cbytes, chn, out| {
         let paused = track.paused.load(Ordering::Relaxed);
         let vol = if track.dop { 1.0 } else { f32::from_bits(volume.load(Ordering::Relaxed)) };
         let fading = track.fadeout.load(Ordering::Relaxed) && !track.dop;
         let step = 1.0 / (FADE_SECS * track.out_rate as f64) as f32;
         let mut gain = f32::from_bits(track.fade_gain.load(Ordering::Relaxed));
         let mut ring = track.ring.lock().unwrap();
+        // 曲の終わり: 準備済みの次のトラックがあれば、このコールバックの中で続きを取って切り替える(ギャップレス)。
+        // 現在のリングの残りに次のリングの先頭をつなぎ、つないだ分は`tail`として先に出す。
+        let mut tail: Vec<f32> = Vec::new();
+        let mut switch_to: Option<Arc<Track>> = None;
+        if !paused && track.primed.load(Ordering::Acquire) && ring.len() / ch < n && track.producer_done.load(Ordering::Acquire) {
+            let nx = track.next.lock().unwrap().take();
+            if let Some(nt) = nx {
+                nt.primed.store(true, Ordering::Release);
+                let mut r2 = nt.ring.lock().unwrap();
+                let (a, b) = take_across(&mut ring, Some(&mut r2), n, ch, &mut tail);
+                drop(r2);
+                let _ = a;
+                nt.consumed.fetch_add(b as u64, Ordering::Relaxed);
+                track.consumed.fetch_add(a as u64, Ordering::Relaxed);
+                track.handed_off.store(true, Ordering::Release);
+                switch_to = Some(nt);
+            }
+        }
         let ring_frames = ring.len() / ch;
         if !paused && !track.primed.load(Ordering::Acquire) && (ring_frames as f64 >= PRIME_SECS * track.out_rate as f64 || track.producer_done.load(Ordering::Acquire)) {
             track.primed.store(true, Ordering::Release);
         }
         // 先読みが溜まるまでは無音(DoPはDSD無音で位相を保つ)
         let avail = if paused || !track.primed.load(Ordering::Acquire) { 0 } else { ring_frames };
-        let take = n.min(avail);
-        let mut samples = ring.drain(..take * ch);
+        let take = if switch_to.is_some() { tail.len() / ch } else { n.min(avail) };
+        let mut tail_it = tail.into_iter();
+        let mut samples = ring.drain(..if switch_to.is_some() { 0 } else { take * ch });
         for f in 0..n {
             if track.dop {
-                dop_fill(&mut marker_even, || if f < take { samples.next().map(dop_payload_from_f32) } else { None }, 1, chn, cbytes, out);
+                dop_fill(&mut marker_even, || if f < take { if switch_to.is_some() { tail_it.next() } else { samples.next() }.map(dop_payload_from_f32) } else { None }, 1, chn, cbytes, out);
             } else {
                 for _c in 0..chn {
                     if fading && _c == 0 && gain > 0.0 {
                         gain = (gain - step).max(0.0);
                     }
-                    let v = if f < take { samples.next().unwrap_or(0.0) * vol * gain } else { 0.0 };
+                    let v = if f < take { if switch_to.is_some() { tail_it.next() } else { samples.next() }.unwrap_or(0.0) * vol * gain } else { 0.0 };
                     let s = quantize(v, bits as u32);
                     if bits >= 32 {
                         // 32bit: 4バイトコンテナへ左詰めで書く(有効24bitの機器は上位24bitだけ使う)。3バイトなら上位24bit。
@@ -660,6 +737,12 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
             }
         }
         drop(samples);
+        if let Some(nt) = switch_to {
+            // 以降は次のトラックのリングを使う(`ring`のロックは先に手放す)
+            drop(ring);
+            track = nt;
+            return true;
+        }
         if fading {
             track.fade_gain.store(gain.to_bits(), Ordering::Relaxed);
             if gain <= 0.0 {
@@ -683,8 +766,14 @@ fn exclusive_thread(track: Arc<Track>, bits: u16, shared: Arc<Mutex<Shared>>, vo
 }
 
 fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume: Arc<AtomicU32>) {
-    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, treble_restore: false, treble_all: false, out_bits: 24, shared_out: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume };
+    let mut ctx = Ctx { playlist: Vec::new(), current: None, mode: PlayMode::Shared, filter: ResampleFilter::Standard, auto_version: true, treble_restore: false, treble_all: false, out_bits: 24, shared_out: None, src_holder: None, host: cpal::default_host(), shared: shared.clone(), volume, active: None, pending: None, pending_failed: None };
     loop {
+        // 出力側が次の曲へ隙間なく切り替えていたら、制御側の状態を付け替える。今の曲の生産が終わっていれば次の曲を先読みする。
+        let handed = shared.lock().unwrap().track.as_ref().is_some_and(|t| t.handed_off.load(Ordering::Acquire));
+        if handed {
+            ctx.promote();
+        }
+        ctx.prefetch_next();
         let ended = shared.lock().unwrap().track.as_ref().is_some_and(|t| t.ended.load(Ordering::Acquire));
         let cmd = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(c) => Some(c),
@@ -705,7 +794,10 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, shared: Arc<Mutex<Shared>>, volume
                 ctx.stop_track();
                 return;
             }
-            Cmd::SetPlaylist(v) => ctx.playlist = v,
+            Cmd::SetPlaylist(v) => {
+                ctx.drop_pending();
+                ctx.playlist = v;
+            }
             Cmd::Stop => {
                 ctx.stop_track();
                 shared.lock().unwrap().status.state = PlayState::Stopped;
@@ -833,6 +925,40 @@ struct Ctx {
     host: cpal::Host,
     shared: Arc<Mutex<Shared>>,
     volume: Arc<AtomicU32>,
+    /// 今鳴らしている出力の形式(ギャップレスで次の曲をつなげられるか判定するため)。
+    active: Option<Active>,
+    /// 先読みして準備済みの次の曲。
+    pending: Option<Prep>,
+    /// 先読みに失敗した曲の位置(同じ曲を何度も読み直さないため)。
+    pending_failed: Option<usize>,
+}
+
+/// 今鳴らしている出力の形式。
+struct Active {
+    exclusive: Option<(u32, u16)>,
+    rate: u32,
+    ch: usize,
+    dop: bool,
+    name: String,
+    stop: Arc<AtomicBool>,
+}
+
+/// 準備済みのトラック(出力は未開始)。
+struct Prep {
+    i: usize,
+    path: String,
+    src: Arc<dyn Source>,
+    mode: PlayMode,
+    exclusive_choice: Option<(u32, u16)>,
+    out_rate: u32,
+    out_ch: usize,
+    dev_name: String,
+    sample_format: Option<SampleFormat>,
+    dev: Option<cpal::Device>,
+    note: String,
+    track: Arc<Track>,
+    /// 今のトラックと同じ出力形式で、隙間なくつなげられる。
+    chained: bool,
 }
 
 /// 「同じ曲」の名前(最初の`.`より前、大文字小文字は区別しない)。`Track04.wav`・`Track04.dsd256.dsf`・`track04.dsd64.dsf`は同じ曲。
@@ -871,6 +997,7 @@ fn exclusive_rates(src_rate: u32, upsample: bool) -> Vec<u32> {
 
 impl Ctx {
     fn stop_track(&mut self) {
+        self.drop_pending();
         // クリック音を避けるため、まず約20msかけて音量を0へ下げてから止める(DoPは音量処理できないので即停止)
         let t = self.shared.lock().unwrap().track.clone();
         if let Some(t) = t {
@@ -980,10 +1107,71 @@ impl Ctx {
     fn start_track(&mut self, i: usize, start_secs: f64) {
         self.stop_track();
         self.shared.lock().unwrap().status.state = PlayState::Stopped;
-        let (i, auto_note) = self.resolve_version(i);
-        self.current = Some(i);
-        let path = self.playlist[i].clone();
         set_msg(&self.shared, "読み込み中... / Loading...");
+        self.current = Some(i); // 読み込みに失敗しても「次へ」が進めるように
+        if let Some(p) = self.prepare(i, start_secs, None) {
+            self.activate(p);
+        }
+    }
+
+    /// 次の曲を先に読み込んでおく(ギャップレス)。今の曲の生産が終わった(最後の数秒がリングに入った)ら呼ぶ。
+    /// 出力形式(排他の有無・レート・ビット・チャンネル・DoP)が今と同じなら、今のトラックの`next`へ登録して
+    /// 出力側が隙間なく切り替える。違えば何もせず(保留は捨てられ)、曲が終わったときに通常の経路で開く。
+    fn prefetch_next(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        if self.current.is_some_and(|c| self.pending_failed == Some(c + 1)) {
+            return;
+        }
+        let (Some(cur), Some(active)) = (self.current, self.active.as_ref()) else { return };
+        if cur + 1 >= self.playlist.len() {
+            return;
+        }
+        let Some(track) = self.shared.lock().unwrap().track.clone() else { return };
+        if !track.producer_done.load(Ordering::Acquire) || track.paused.load(Ordering::Relaxed) {
+            return;
+        }
+        let chain = Active { exclusive: active.exclusive, rate: active.rate, ch: active.ch, dop: active.dop, name: active.name.clone(), stop: active.stop.clone() };
+        let Some(p) = self.prepare(cur + 1, 0.0, Some(&chain)) else {
+            // 読み込めない曲: 保留にせず、ここでは何もしない(曲が終わったとき通常の経路でエラーを出す)
+            self.pending_failed = Some(cur + 1);
+            return;
+        };
+        if p.chained {
+            *track.next.lock().unwrap() = Some(p.track.clone());
+        }
+        self.pending = Some(p);
+    }
+
+    /// 出力側が次のトラックへ切り替えた後の、制御側の付け替え(状態表示・現在位置)。
+    fn promote(&mut self) {
+        let Some(p) = self.pending.take() else { return };
+        let old = self.shared.lock().unwrap().track.take();
+        if let Some(old) = old {
+            old.retired.store(true, Ordering::Relaxed);
+        }
+        self.current = Some(p.i);
+        self.src_holder = Some(p.src.clone());
+        self.apply_status(&p, None);
+        self.shared.lock().unwrap().track = Some(p.track.clone());
+    }
+
+    /// 準備済みの保留トラックを捨てる(プレイリストの変更・停止・手動の曲移動のとき)。
+    fn drop_pending(&mut self) {
+        self.pending_failed = None;
+        if let Some(p) = self.pending.take() {
+            p.track.retired.store(true, Ordering::Relaxed);
+            if !p.chained {
+                p.track.stop.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// トラックを組み立てて生産スレッドを始める(出力はまだ始めない)。`chain`があれば、同じ出力形式のとき停止フラグを共有する。
+    fn prepare(&mut self, i: usize, start_secs: f64, chain: Option<&Active>) -> Option<Prep> {
+        let (i, auto_note) = self.resolve_version(i);
+        let path = self.playlist[i].clone();
         let is_dsd = crate::media::probe(&path).kind == crate::media::MediaKind::Dsd;
         let want_dop = self.mode == PlayMode::Dop && is_dsd;
         // 排他アップサンプル(E)のDSDは、352.8kHzへ直接変換する(176.4kHz→352.8kHzの2段階変換にしない)
@@ -1002,7 +1190,7 @@ impl Ctx {
             Ok(s) => s,
             Err(e) => {
                 set_msg(&self.shared, format!("再生できません({path}): {e}"));
-                return;
+                return None;
             }
         };
         let mut mode = self.mode;
@@ -1078,13 +1266,13 @@ impl Ctx {
         } else {
             let Some(device) = self.host.default_output_device() else {
                 set_msg(&self.shared, "出力デバイスがありません / No output device");
-                return;
+                return None;
             };
             let default = match device.default_output_config() {
                 Ok(c) => c,
                 Err(e) => {
                     set_msg(&self.shared, format!("デバイスの設定を取得できません: {e}"));
-                    return;
+                    return None;
                 }
             };
             (default.sample_rate(), default.channels() as usize, device.description().map(|d| d.name().to_string()).unwrap_or_default(), Some(default.sample_format()), Some(device))
@@ -1102,12 +1290,18 @@ impl Ctx {
         }
         // 再生開始直後にRING_SECS秒ぶんまで一気に溜め込むため、あらかじめ確保しておく
         // (再確保のたびにロックを長く保持すると、共有モードの出力コールバックの待ちが伸びてクリックの原因になる)。
+        let dop = src.kind() == "DoP";
+        let chained = chain.is_some_and(|a| a.exclusive == exclusive_choice && a.rate == out_rate && a.ch == out_ch && a.dop == dop && (exclusive_choice.is_some() || a.name == dev_name));
+        let chain_stop = if chained { chain.map(|a| a.stop.clone()) } else { None };
         let ring_capacity_hint = (RING_SECS * out_rate as f64) as usize * out_ch;
         let track = Arc::new(Track {
             ring: Mutex::new(VecDeque::with_capacity(ring_capacity_hint)),
             paused: AtomicBool::new(false),
             ended: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
+            stop: chain_stop.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            retired: AtomicBool::new(false),
+            handed_off: AtomicBool::new(false),
+            next: Mutex::new(None),
             producer_done: AtomicBool::new(false),
             seek_gen: AtomicU64::new(0),
             seek_src_frame: AtomicU64::new(0),
@@ -1122,7 +1316,7 @@ impl Ctx {
             fadeout: AtomicBool::new(false),
             faded: AtomicBool::new(false),
             fade_gain: AtomicU32::new(1.0f32.to_bits()),
-            dop: src.kind() == "DoP",
+            dop,
             // AI強化版(open-audio-sr)を再生しているときは、実在の高域が既にあるのでリアルタイムEQは重ねない。
             treble_restore: treble_target && ai_enhanced.is_none(),
         });
@@ -1136,6 +1330,13 @@ impl Ctx {
         }
         let (t2, s2) = (track.clone(), src.clone());
         std::thread::spawn(move || producer(t2, s2));
+        Some(Prep { i, path, src, mode, exclusive_choice, out_rate, out_ch, dev_name, sample_format, dev, note, track, chained })
+    }
+
+    /// 準備したトラックの出力を始める(排他スレッドの起動、または共有ストリームへの差し込み)と、状態表示の更新。
+    fn activate(&mut self, p: Prep) {
+        let Prep { i: _, path: _, src, mode: _, exclusive_choice, out_rate, out_ch, dev_name, sample_format, dev, note: _, track, chained: _ } = &p;
+        let (src, exclusive_choice, out_rate, out_ch, dev_name, sample_format, dev, track) = (src.clone(), *exclusive_choice, *out_rate, *out_ch, dev_name.clone(), *sample_format, dev.clone(), track.clone());
         let mut device_label = dev_name.clone();
         if let Some((_, bits)) = exclusive_choice {
             #[cfg(windows)]
@@ -1179,6 +1380,15 @@ impl Ctx {
             }
         }
         self.src_holder = Some(src.clone());
+        self.active = Some(Active { exclusive: exclusive_choice, rate: out_rate, ch: out_ch, dop: track.dop, name: dev_name.clone(), stop: track.stop.clone() });
+        self.apply_status(&p, Some(device_label));
+        self.shared.lock().unwrap().track = Some(track);
+    }
+
+    /// 状態表示(曲・経路・注記)を更新する。`device_label`が`None`なら機器名は今のまま。
+    fn apply_status(&mut self, p: &Prep, device_label: Option<String>) {
+        let (i, path, src, mode, out_rate, note) = (p.i, p.path.clone(), p.src.clone(), p.mode, p.out_rate, p.note.clone());
+        self.current = Some(i);
         // 経路の説明
         let kind = src.kind();
         let src_rate = src.rate_hz();
@@ -1194,7 +1404,9 @@ impl Ctx {
         g.status.index = Some(i);
         g.status.path = Some(path);
         g.status.duration_secs = src.duration_secs();
-        g.status.device = device_label;
+        if let Some(d) = device_label {
+            g.status.device = d;
+        }
         g.status.out_rate_hz = out_rate;
         g.status.source_rate_hz = src_rate;
         g.status.source_kind = kind;
@@ -1204,7 +1416,6 @@ impl Ctx {
         g.status.route_en = route_en;
         g.status.note = note;
         g.status.message = String::new();
-        g.track = Some(track);
     }
 }
 
@@ -1218,6 +1429,83 @@ fn default_device_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_track(frames: std::ops::Range<u32>, done: bool) -> Arc<Track> {
+        let ring: VecDeque<f32> = frames.flat_map(|f| [f as f32, -(f as f32)]).collect();
+        Arc::new(Track {
+            ring: Mutex::new(ring),
+            paused: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+            stop: Arc::new(AtomicBool::new(false)),
+            retired: AtomicBool::new(false),
+            handed_off: AtomicBool::new(false),
+            next: Mutex::new(None),
+            producer_done: AtomicBool::new(done),
+            seek_gen: AtomicU64::new(0),
+            seek_src_frame: AtomicU64::new(0),
+            consumed: AtomicU64::new(0),
+            underrun_frames: AtomicU64::new(0),
+            primed: AtomicBool::new(true),
+            base: AtomicU64::new(0),
+            out_rate: 48_000,
+            out_ch: 2,
+            total_secs: 1.0,
+            filter: ResampleFilter::Standard,
+            fadeout: AtomicBool::new(false),
+            faded: AtomicBool::new(false),
+            fade_gain: AtomicU32::new(1.0f32.to_bits()),
+            dop: false,
+            treble_restore: false,
+        })
+    }
+
+    #[test]
+    fn shared_callback_switches_to_the_next_track_inside_one_buffer() {
+        let a = test_track(1..6, true); // 5フレーム
+        let b = test_track(100..120, false);
+        *a.next.lock().unwrap() = Some(b.clone());
+        let slot: Slot = Arc::new(Mutex::new(Some(a.clone())));
+        let vol = AtomicU32::new(1.0f32.to_bits());
+        let mut out = [0.0f32; 16]; // 8フレーム
+        fill_shared(&slot, &vol, 2, &mut out);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert_eq!(left, vec![1.0, 2.0, 3.0, 4.0, 5.0, 100.0, 101.0, 102.0], "曲の境目に無音が入らない");
+        assert!(a.handed_off.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(slot.lock().unwrap().as_ref().unwrap(), &b));
+        assert_eq!(b.underrun_frames.load(Ordering::Relaxed) + a.underrun_frames.load(Ordering::Relaxed), 0);
+        // 次のコールバックは次のトラックの続きから
+        fill_shared(&slot, &vol, 2, &mut out);
+        assert_eq!(out[0], 103.0);
+        // 次が無ければ、終わりで無音になり曲の終了が報告される
+        let c = test_track(1..3, true);
+        let slot2: Slot = Arc::new(Mutex::new(Some(c.clone())));
+        let mut o2 = [9.0f32; 8];
+        fill_shared(&slot2, &vol, 2, &mut o2);
+        assert_eq!(&o2[..4], &[1.0, -1.0, 2.0, -2.0]);
+        assert!(o2[4..].iter().all(|v| *v == 0.0));
+        assert!(c.ended.load(Ordering::Relaxed) && !c.handed_off.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn take_across_continues_into_the_next_ring_without_a_gap() {
+        let mut cur: VecDeque<f32> = (0..6).map(|v| v as f32).collect(); // 3フレーム(2ch)
+        let mut next: VecDeque<f32> = (100..110).map(|v| v as f32).collect(); // 5フレーム
+        let mut out = Vec::new();
+        let (a, b) = take_across(&mut cur, Some(&mut next), 5, 2, &mut out);
+        assert_eq!((a, b), (3, 2));
+        assert_eq!(out, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 100.0, 101.0, 102.0, 103.0]);
+        assert_eq!(next.len(), 6, "使った分だけ次のリングから減る");
+        // 今のリングに残りがあるうちは次のリングに触らない
+        let mut cur2: VecDeque<f32> = (0..8).map(|v| v as f32).collect();
+        let mut out2 = Vec::new();
+        let (a, b) = take_across(&mut cur2, Some(&mut next), 2, 2, &mut out2);
+        assert_eq!((a, b), (2, 0));
+        assert_eq!(next.len(), 6);
+        // 次が無ければ今の分だけ
+        let mut cur3: VecDeque<f32> = (0..2).map(|v| v as f32).collect();
+        let mut out3 = Vec::new();
+        assert_eq!(take_across(&mut cur3, None, 4, 2, &mut out3), (1, 0));
+    }
 
     #[test]
     fn every_mode_has_bilingual_text_and_a_distinct_letter() {
