@@ -167,9 +167,14 @@ fn main() -> ExitCode {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            let last = p.status();
             p.stop();
             m.sync.ipc.quit();
             let _ = m.child.wait();
+            if !started {
+                eprintln!("音声が始まりませんでした: {}", if last.message.is_empty() { "(理由不明)" } else { &last.message });
+                return ExitCode::FAILURE;
+            }
             ExitCode::SUCCESS
         }
         Some("play") if args.len() >= 2 => {
