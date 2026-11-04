@@ -10,6 +10,7 @@ fn usage() -> ExitCode {
   open-bar play <file> --exclusive [--bits 16|24] [--volume V]   WASAPI排他モード(Windows、ビットパーフェクト)
   open-bar play <file.dsf> --dop [--seconds N]                   DoPで送る(**DoP対応DACのみ**。非対応だと大音量のノイズ)
   open-bar queue [--rg] [--volume V] <file>...                   複数曲をギャップレスで連続再生(--rg=ReplayGain)
+  open-bar video <video> <audio> [--mpv PATH] [--seconds N]   映像(mpv)+音声(音声が時間の基準で映像が追従)。<combo.obar.json>も可
   open-bar pair <folder>                      同名の映像+音声を自動で組み合わせて表示"
     );
     ExitCode::from(2)
@@ -101,6 +102,75 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Some("video") if args.len() >= 2 => {
+            // 映像(mpv)+音声(open-bar)。音声が時間の基準で、映像が追従する。
+            let (mut mpv, mut secs, mut files) = (std::env::var("OPEN_BAR_MPV").unwrap_or_else(|_| "mpv".into()), None::<f64>, Vec::new());
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--mpv" if i + 1 < args.len() => {
+                        mpv = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--seconds" if i + 1 < args.len() => {
+                        secs = args[i + 1].parse().ok();
+                        i += 2;
+                    }
+                    f => {
+                        files.push(f.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            let combo = match files.as_slice() {
+                [j] if j.ends_with(".json") => match std::fs::read_to_string(j).map_err(|e| e.to_string()).and_then(|t| combo::Combo::from_json(&t).map_err(|e| e.to_string())) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                [v, a] => combo::Combo { video: v.clone(), audio: a.clone(), audio_offset_ms: 0 },
+                _ => return usage(),
+            };
+            if let Err(e) = combo.validate() {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+            // 音声を遅らせる(正)なら映像は音声より先へ進める
+            let offset = combo.audio_offset_ms as f64 / 1000.0;
+            let mut m = match open_bar::video::spawn_mpv(&mpv, &combo.video, 0.0, offset, 15.0, &[]) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("{e}(mpvのパスは --mpv か環境変数 OPEN_BAR_MPV で指定)");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let p = open_bar::player::Player::new();
+            p.set_playlist(vec![combo.audio.clone()]);
+            p.play(0);
+            let t0 = std::time::Instant::now();
+            let mut started = false;
+            loop {
+                let s = p.status();
+                let playing = s.state == open_bar::player::PlayState::Playing;
+                started |= playing;
+                if (started && s.state == open_bar::player::PlayState::Stopped) || secs.is_some_and(|x| t0.elapsed().as_secs_f64() > x) || t0.elapsed().as_secs() > 120 && !started {
+                    break;
+                }
+                if started {
+                    if let Err(e) = m.sync.tick(s.position_secs, playing) {
+                        eprintln!("{e}");
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            p.stop();
+            m.sync.ipc.quit();
+            let _ = m.child.wait();
+            ExitCode::SUCCESS
         }
         Some("play") if args.len() >= 2 => {
             let mut opts = output::PlayOpts::default();

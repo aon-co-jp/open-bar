@@ -37,4 +37,5 @@ pub mod playlist;
 pub mod polyphase;
 pub mod source;
 pub mod treble;
+pub mod video;
 pub use open_mqa_dsd as dsd;
