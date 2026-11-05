@@ -14,6 +14,11 @@
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: "Segoe UI", "Yu Gothic UI", system-ui, sans-serif; font-size: 14px; }
 body { display: flex; flex-direction: column; }
+/* アプリの窓へ映像を埋め込むとき、映像の枠(#video-area)だけを透明にして裏のmpvを見せる。他は不透明 */
+html, body { background: transparent; }
+body > :where(:not(#video-area)) { background: var(--bg); }
+#video-area { height: 38vh; min-height: 160px; background: transparent; border-bottom: 1px solid var(--line); }
+#video-area[hidden] { display: none; }
 button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
 button:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; min-width: 48px; }

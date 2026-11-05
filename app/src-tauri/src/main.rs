@@ -12,6 +12,9 @@ struct VideoState {
     disabled: std::sync::atomic::AtomicBool,
     error: std::sync::Mutex<String>,
     open: std::sync::atomic::AtomicBool,
+    /// 埋め込み時の映像の枠(余白の割合 左・右・上・下)
+    margins: std::sync::Mutex<[f64; 4]>,
+    embedded: std::sync::atomic::AtomicBool,
 }
 
 use tauri::{Emitter, Manager, State};
@@ -119,6 +122,16 @@ fn player_status(player: State<Player>) -> Status {
 fn video_set_enabled(v: State<std::sync::Arc<VideoState>>, on: bool) {
     v.disabled.store(!on, std::sync::atomic::Ordering::Relaxed);
 }
+/// 映像の枠(ページ内の透明な穴)を、窓に対する余白の割合で受け取る。
+#[tauri::command]
+fn video_set_rect(v: State<std::sync::Arc<VideoState>>, left: f64, right: f64, top: f64, bottom: f64) {
+    *v.margins.lock().unwrap() = [left, right, top, bottom];
+}
+/// 映像をアプリの窓へ埋め込んでいるか(していなければ別窓)。
+#[tauri::command]
+fn video_embedded(v: State<std::sync::Arc<VideoState>>) -> bool {
+    v.embedded.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// 映像の状態: (開いているか, エラー)。
 #[tauri::command]
 fn video_status(v: State<std::sync::Arc<VideoState>>) -> (bool, String) {
@@ -190,8 +203,19 @@ fn main() {
             std::thread::spawn(move || {
                 let mpv = std::env::var("OPEN_BAR_MPV").unwrap_or_else(|_| "mpv".into());
                 let mut f = open_bar::video::VideoFollower::new(mpv);
+                // Windowsは既定でアプリの窓へ映像を埋め込む(透明な窓+mpvの--wid)。OPEN_BAR_EMBED=0 で別窓にする
+                #[cfg(windows)]
+                if std::env::var("OPEN_BAR_EMBED").as_deref() != Ok("0") {
+                    if let Some(w) = handle.get_webview_window("main") {
+                        if let Ok(h) = w.hwnd() {
+                            f.extra_args.push(format!("--wid={}", h.0 as isize));
+                            vs.embedded.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
                 loop {
                     let st = handle.state::<Player>().status();
+                    f.margins = *vs.margins.lock().unwrap();
                     f.step(&st, !vs.disabled.load(std::sync::atomic::Ordering::Relaxed));
                     vs.open.store(f.is_open(), std::sync::atomic::Ordering::Relaxed);
                     if *vs.error.lock().unwrap() != f.last_error {
@@ -205,7 +229,7 @@ fn main() {
         })
         .manage(Player::new())
         .manage(std::sync::Arc::new(VideoState::default()))
-        .invoke_handler(tauri::generate_handler![probe_file, scan_folder, startup_files, player_set_playlist, player_play, player_pause, player_resume, player_stop, player_next, player_prev, player_seek, player_set_volume, player_status, player_modes, player_set_mode, player_set_filter, player_set_auto_version, player_set_treble_restore, video_set_enabled, video_status])
+        .invoke_handler(tauri::generate_handler![probe_file, scan_folder, startup_files, player_set_playlist, player_play, player_pause, player_resume, player_stop, player_next, player_prev, player_seek, player_set_volume, player_status, player_modes, player_set_mode, player_set_filter, player_set_auto_version, player_set_treble_restore, video_set_enabled, video_status, video_set_rect, video_embedded])
         .run(tauri::generate_context!())
         .expect("open-barの起動に失敗しました");
 }

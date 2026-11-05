@@ -213,6 +213,7 @@ function renderBanner(st) {
   if (selectedMode && st.selected_mode === selectedMode && (!playing || actual.id === selectedMode || st.note)) selectedMode = null; // 反映済み
 }
 
+let lastRect = "";
 async function poll() {
   try {
     const st = await invoke("player_status");
@@ -226,6 +227,18 @@ async function poll() {
     $("status-route").textContent = st.device ? `${st.device}` : "";
     $("status-msg").textContent = st.message || "";
     const [vopen, verr] = await invoke("video_status");
+    // 埋め込み時: 映像が開いている間だけ透明な穴を出し、その位置・大きさをmpvへ伝える
+    const area = $("video-area");
+    const embedded = await invoke("video_embedded");
+    area.hidden = !(embedded && vopen);
+    if (!area.hidden) {
+      const r = area.getBoundingClientRect(), W = window.innerWidth, H = window.innerHeight;
+      const key = [r.left / W, (W - r.right) / W, r.top / H, (H - r.bottom) / H].map((x) => Math.max(0, x));
+      if (key.join() !== lastRect) {
+        lastRect = key.join();
+        invoke("video_set_rect", { left: key[0], right: key[1], top: key[2], bottom: key[3] });
+      }
+    }
     if (verr) $("video-msg").textContent = verr;
     else if (vopen) $("video-msg").textContent = "映像を表示中 / Video window open";
     $("pos-label").textContent = fmtTime(st.position_secs);

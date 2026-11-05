@@ -125,6 +125,14 @@ impl<R: BufRead, W: Write> MpvIpc<R, W> {
         self.command(&[json!("seek"), json!(secs), json!("absolute+exact")]).map(|_| ())
     }
 
+    /// 映像の描画範囲を窓の端からの割合(0〜1)で狭める。アプリの窓へ埋め込むとき、映像を所定の枠に収める。
+    pub fn set_margins(&mut self, left: f64, right: f64, top: f64, bottom: f64) -> Result<(), VideoError> {
+        for (name, v) in [("video-margin-ratio-left", left), ("video-margin-ratio-right", right), ("video-margin-ratio-top", top), ("video-margin-ratio-bottom", bottom)] {
+            self.command(&[json!("set_property"), json!(name), json!(v.clamp(0.0, 0.95))])?;
+        }
+        Ok(())
+    }
+
     pub fn quit(&mut self) {
         let _ = self.command(&[json!("quit")]);
     }
@@ -402,12 +410,17 @@ pub struct VideoFollower {
     mpv_path: String,
     current: Option<(String, Mpv)>,
     dismissed: Option<String>,
+    /// mpvへ足す引数(例: `--wid=<ウィンドウID>`で別窓でなくアプリの窓へ描画させる)。
+    pub extra_args: Vec<String>,
+    /// 埋め込み時の描画範囲(左・右・上・下の余白の割合)。変わったらmpvへ送る。
+    pub margins: [f64; 4],
+    applied_margins: [f64; 4],
     pub last_error: String,
 }
 
 impl VideoFollower {
     pub fn new(mpv_path: impl Into<String>) -> Self {
-        Self { mpv_path: mpv_path.into(), current: None, dismissed: None, last_error: String::new() }
+        Self { mpv_path: mpv_path.into(), current: None, dismissed: None, extra_args: Vec::new(), margins: [0.0; 4], applied_margins: [0.0; 4], last_error: String::new() }
     }
 
     /// 映像ウィンドウが開いているか。
@@ -437,8 +450,12 @@ impl VideoFollower {
         }
         let Some(path) = want else { return };
         if self.current.is_none() && self.dismissed.as_deref() != Some(path.as_str()) {
-            match spawn_mpv(&self.mpv_path, &path, st.position_secs, 0.0, 10.0, &[]) {
+            match {
+                let extra: Vec<&str> = self.extra_args.iter().map(String::as_str).collect();
+                spawn_mpv(&self.mpv_path, &path, st.position_secs, 0.0, 10.0, &extra)
+            } {
                 Ok(m) => {
+                    self.applied_margins = [0.0; 4];
                     self.current = Some((path.clone(), m));
                     self.last_error.clear();
                 }
@@ -446,6 +463,14 @@ impl VideoFollower {
                     self.last_error = format!("{e}(mpvのパスは環境変数 OPEN_BAR_MPV で指定 / set OPEN_BAR_MPV)");
                     self.dismissed = Some(path);
                     return;
+                }
+            }
+        }
+        if let Some((_, m)) = self.current.as_mut() {
+            if self.margins != self.applied_margins {
+                let g = self.margins;
+                if m.sync.ipc.set_margins(g[0], g[1], g[2], g[3]).is_ok() {
+                    self.applied_margins = g;
                 }
             }
         }
