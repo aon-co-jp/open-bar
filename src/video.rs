@@ -139,12 +139,17 @@ pub struct VideoSync<R: BufRead, W: Write> {
     paused: bool,
     /// 直近のずれ(映像 − 音声、秒)。表示・試験用。
     pub last_drift: Option<f64>,
+    /// シーク直後はmpvの映像が少し止まる(デコードのやり直し。Linuxで0.2秒ほど)ので、その間は続けてシークしない。
+    pub seek_grace: std::time::Duration,
+    seeked_at: Option<std::time::Instant>,
+    /// シーク後に映像が止まる秒数の見積もり(猶予明けのずれから学習)。次のシークは、その分だけ先へ飛ぶ。
+    seek_lead: f64,
 }
 
 impl<R: BufRead, W: Write> VideoSync<R, W> {
     pub fn new(ipc: MpvIpc<R, W>, offset_secs: f64) -> Self {
         // mpvは`--pause`で起動するので、最初は一時停止中
-        Self { ipc, offset_secs, speed: 1.0, paused: true, last_drift: None }
+        Self { ipc, offset_secs, speed: 1.0, paused: true, last_drift: None, seek_grace: std::time::Duration::from_millis(600), seeked_at: None, seek_lead: 0.0 }
     }
 
     /// 音声の位置(秒)と再生中かどうかから、映像を合わせる。行った補正を返す。
@@ -153,7 +158,10 @@ impl<R: BufRead, W: Write> VideoSync<R, W> {
         if playing == self.paused {
             if playing {
                 // 再開の直前に音声の位置へ合わせておく(一時停止中のずれや起動時の位置を引きずらない)
-                self.ipc.seek_absolute(target.max(0.0))?;
+                // mpvがファイルを読み込み終える前はシークが失敗する。その間は一時停止のまま次の周期で再試行する
+                if self.ipc.seek_absolute(target.max(0.0)).is_err() {
+                    return Ok(Correction::None);
+                }
             }
             self.ipc.set_pause(!playing)?;
             self.paused = !playing;
@@ -170,7 +178,23 @@ impl<R: BufRead, W: Write> VideoSync<R, W> {
         let Some(v) = self.ipc.time_pos()? else { return Ok(Correction::None) };
         let drift = v - target;
         self.last_drift = Some(drift);
-        let c = plan_correction(drift, target);
+        let mut c = plan_correction(drift, target);
+        if let Some(t0) = self.seeked_at {
+            if t0.elapsed() < self.seek_grace {
+                // 猶予中: シークの連打を避け、速度補正だけにとどめる
+                if matches!(c, Correction::Seek(_)) {
+                    c = Correction::Speed(1.0 + MAX_SPEED_DELTA);
+                }
+            } else {
+                // 猶予明けの最初のずれから、シーク後の停止ぶんを学習する
+                self.seek_lead = (-drift).clamp(0.0, 1.0);
+                self.seeked_at = None;
+                c = plan_correction(drift, target);
+            }
+        }
+        if let Correction::Seek(t) = c {
+            c = Correction::Seek(t + self.seek_lead);
+        }
         match c {
             Correction::None => {
                 if (self.speed - 1.0).abs() > f64::EPSILON {
@@ -184,6 +208,7 @@ impl<R: BufRead, W: Write> VideoSync<R, W> {
             }
             Correction::Seek(t) => {
                 self.ipc.seek_absolute(t)?;
+                self.seeked_at = Some(std::time::Instant::now());
                 if (self.speed - 1.0).abs() > f64::EPSILON {
                     self.ipc.set_speed(1.0)?;
                     self.speed = 1.0;
@@ -367,5 +392,76 @@ mod tests {
         assert!(a.contains(&"--input-ipc-server=PIPE".to_string()));
         assert!(a.contains(&"--start=1.5".to_string()));
         assert_eq!(a.last().unwrap(), "a.mp4");
+    }
+}
+
+/// プレーヤーの再生に映像ウィンドウ(mpv)を追従させる。GUI・CLI共通。
+/// 再生中の曲が映像コンテナ(MP4/MKV…)のときだけmpvを開き、曲が変わる・止まる・映像でなくなると閉じる。
+/// ユーザーがmpvのウィンドウを閉じたら、その曲の間は開き直さない。
+pub struct VideoFollower {
+    mpv_path: String,
+    current: Option<(String, Mpv)>,
+    dismissed: Option<String>,
+    pub last_error: String,
+}
+
+impl VideoFollower {
+    pub fn new(mpv_path: impl Into<String>) -> Self {
+        Self { mpv_path: mpv_path.into(), current: None, dismissed: None, last_error: String::new() }
+    }
+
+    /// 映像ウィンドウが開いているか。
+    pub fn is_open(&self) -> bool {
+        self.current.is_some()
+    }
+
+    fn close(&mut self) {
+        if let Some((_, mut m)) = self.current.take() {
+            m.sync.ipc.quit();
+            let _ = m.child.wait();
+        }
+    }
+
+    /// 100ms周期などで呼ぶ。`enabled`がfalseなら映像を閉じる。
+    pub fn step(&mut self, st: &crate::player::Status, enabled: bool) {
+        use crate::player::PlayState;
+        let want = match (&st.path, st.state, enabled) {
+            (Some(p), PlayState::Playing | PlayState::Paused, true) if crate::media::probe_kind_only(p) == crate::media::MediaKind::VideoContainer => Some(p.clone()),
+            _ => None,
+        };
+        if want.as_ref() != self.dismissed.as_ref() {
+            self.dismissed = None;
+        }
+        if self.current.as_ref().map(|(p, _)| p) != want.as_ref() {
+            self.close();
+        }
+        let Some(path) = want else { return };
+        if self.current.is_none() && self.dismissed.as_deref() != Some(path.as_str()) {
+            match spawn_mpv(&self.mpv_path, &path, st.position_secs, 0.0, 10.0, &[]) {
+                Ok(m) => {
+                    self.current = Some((path.clone(), m));
+                    self.last_error.clear();
+                }
+                Err(e) => {
+                    self.last_error = format!("{e}(mpvのパスは環境変数 OPEN_BAR_MPV で指定 / set OPEN_BAR_MPV)");
+                    self.dismissed = Some(path);
+                    return;
+                }
+            }
+        }
+        if let Some((p, m)) = self.current.as_mut() {
+            if m.sync.tick(st.position_secs, st.state == PlayState::Playing).is_err() {
+                // mpvが閉じられた(ユーザーがウィンドウを閉じた等)
+                let p = p.clone();
+                self.close();
+                self.dismissed = Some(p);
+            }
+        }
+    }
+}
+
+impl Drop for VideoFollower {
+    fn drop(&mut self) {
+        self.close();
     }
 }

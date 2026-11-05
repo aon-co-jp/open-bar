@@ -161,6 +161,7 @@ function initFilters() {
   cut.addEventListener("input", () => ($("cutoff-val").textContent = `${cut.value}%`));
   cut.addEventListener("change", () => invoke("player_set_filter", { filter: { custom: parseInt(cut.value, 10) } }));
   $("auto-version").addEventListener("change", (e) => invoke("player_set_auto_version", { on: e.target.checked }));
+  $("video-on").addEventListener("change", (e) => invoke("video_set_enabled", { on: e.target.checked }));
   $("treble-restore").addEventListener("change", (e) => invoke("player_set_treble_restore", { on: e.target.checked }));
   const box = $("filter-buttons");
   for (const f of FILTERS) {
@@ -224,6 +225,9 @@ async function poll() {
     renderFilters(st);
     $("status-route").textContent = st.device ? `${st.device}` : "";
     $("status-msg").textContent = st.message || "";
+    const [vopen, verr] = await invoke("video_status");
+    if (verr) $("video-msg").textContent = verr;
+    else if (vopen) $("video-msg").textContent = "映像を表示中 / Video window open";
     $("pos-label").textContent = fmtTime(st.position_secs);
     $("dur-label").textContent = fmtTime(st.duration_secs);
     if (!dragging && st.duration_secs > 0) seekEl.value = Math.round((st.position_secs / st.duration_secs) * 1000);

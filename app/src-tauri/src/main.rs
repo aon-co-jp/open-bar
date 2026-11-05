@@ -6,6 +6,14 @@ use open_bar::output::ResampleFilter;
 use open_bar::player::{mode_text, ModeText, PlayMode, Player, Status};
 mod presence;
 
+/// 映像ウィンドウ(mpv)の設定と状態。映像コンテナの曲を再生すると、音声に追従するmpvのウィンドウを開く。
+#[derive(Default)]
+struct VideoState {
+    disabled: std::sync::atomic::AtomicBool,
+    error: std::sync::Mutex<String>,
+    open: std::sync::atomic::AtomicBool,
+}
+
 use tauri::{Emitter, Manager, State};
 
 #[tauri::command]
@@ -106,6 +114,17 @@ fn player_status(player: State<Player>) -> Status {
     player.status()
 }
 
+/// 映像を表示するか(既定=表示)。/ Show video (default on).
+#[tauri::command]
+fn video_set_enabled(v: State<std::sync::Arc<VideoState>>, on: bool) {
+    v.disabled.store(!on, std::sync::atomic::Ordering::Relaxed);
+}
+/// 映像の状態: (開いているか, エラー)。
+#[tauri::command]
+fn video_status(v: State<std::sync::Arc<VideoState>>) -> (bool, String) {
+    (v.open.load(std::sync::atomic::Ordering::Relaxed), v.error.lock().unwrap().clone())
+}
+
 /// 起動引数(ファイル/`openbar://`のURL)を処理する: URLのトークンは保存、ファイルはフロントへ渡して追加・再生する。
 fn handle_args(app: &tauri::AppHandle, args: &[String], cfg_path: &std::path::Path, shared: &presence::Shared) {
     let mut files = Vec::new();
@@ -165,10 +184,28 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_secs(10));
                 }
             });
+            // 映像: 再生中の曲が映像コンテナなら、音声に追従するmpvの窓を開く(100ms周期)
+            let handle = app.handle().clone();
+            let vs = app.state::<std::sync::Arc<VideoState>>().inner().clone();
+            std::thread::spawn(move || {
+                let mpv = std::env::var("OPEN_BAR_MPV").unwrap_or_else(|_| "mpv".into());
+                let mut f = open_bar::video::VideoFollower::new(mpv);
+                loop {
+                    let st = handle.state::<Player>().status();
+                    f.step(&st, !vs.disabled.load(std::sync::atomic::Ordering::Relaxed));
+                    vs.open.store(f.is_open(), std::sync::atomic::Ordering::Relaxed);
+                    if *vs.error.lock().unwrap() != f.last_error {
+                        eprintln!("video: {}", f.last_error);
+                    }
+                    *vs.error.lock().unwrap() = f.last_error.clone();
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
             Ok(())
         })
         .manage(Player::new())
-        .invoke_handler(tauri::generate_handler![probe_file, scan_folder, startup_files, player_set_playlist, player_play, player_pause, player_resume, player_stop, player_next, player_prev, player_seek, player_set_volume, player_status, player_modes, player_set_mode, player_set_filter, player_set_auto_version, player_set_treble_restore])
+        .manage(std::sync::Arc::new(VideoState::default()))
+        .invoke_handler(tauri::generate_handler![probe_file, scan_folder, startup_files, player_set_playlist, player_play, player_pause, player_resume, player_stop, player_next, player_prev, player_seek, player_set_volume, player_status, player_modes, player_set_mode, player_set_filter, player_set_auto_version, player_set_treble_restore, video_set_enabled, video_status])
         .run(tauri::generate_context!())
         .expect("open-barの起動に失敗しました");
 }
