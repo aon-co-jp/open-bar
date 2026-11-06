@@ -306,6 +306,18 @@ fn connect(path: &str) -> std::io::Result<Conn> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ipc_names_are_unique_within_one_process() {
+        // 同じプロセスで何個mpvを起動しても、パイプ/ソケット名がぶつからない
+        let names: std::collections::HashSet<String> = (0..1000).map(|_| ipc_name()).collect();
+        assert_eq!(names.len(), 1000);
+        // 複数スレッドから同時に取っても重ならない
+        let hs: Vec<_> = (0..8).map(|_| std::thread::spawn(|| (0..200).map(|_| ipc_name()).collect::<Vec<_>>())).collect();
+        let all: Vec<String> = hs.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let set: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(set.len(), all.len());
+    }
+
     use super::*;
     use std::io::Cursor;
 
