@@ -246,7 +246,9 @@ pub fn mpv_args(video: &str, ipc_path: &str, start_secs: f64) -> Vec<String> {
 
 /// このプロセス用のIPC名(Windowsは名前付きパイプ、それ以外はtempのソケット)。
 pub fn ipc_name() -> String {
-    let id = std::process::id();
+    // 同じプロセスで複数のmpvを起動しても名前がぶつからないよう、連番も付ける
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = format!("{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     if cfg!(windows) {
         format!(r"\\.\pipe\open-bar-mpv-{id}")
     } else {
@@ -407,7 +409,7 @@ mod tests {
 /// 再生中の曲が映像コンテナ(MP4/MKV…)のときだけmpvを開き、曲が変わる・止まる・映像でなくなると閉じる。
 /// ユーザーがmpvのウィンドウを閉じたら、その曲の間は開き直さない。
 pub struct VideoFollower {
-    mpv_path: String,
+    pub mpv_path: String,
     current: Option<(String, Mpv)>,
     dismissed: Option<String>,
     /// mpvへ足す引数(例: `--wid=<ウィンドウID>`で別窓でなくアプリの窓へ描画させる)。
@@ -416,11 +418,18 @@ pub struct VideoFollower {
     pub margins: [f64; 4],
     applied_margins: [f64; 4],
     pub last_error: String,
+    /// mpvの起動に失敗してから再試行するまでの間隔と、あきらめるまでの回数。
+    /// 初回起動は遅いことがある(ウイルス対策のスキャン・ディスクキャッシュなし)ので、1回の失敗では見切らない。
+    pub retry_delay: std::time::Duration,
+    pub max_attempts: u32,
+    pub attempts: u32,
+    retry_at: Option<std::time::Instant>,
+    last_want: Option<String>,
 }
 
 impl VideoFollower {
     pub fn new(mpv_path: impl Into<String>) -> Self {
-        Self { mpv_path: mpv_path.into(), current: None, dismissed: None, extra_args: Vec::new(), margins: [0.0; 4], applied_margins: [0.0; 4], last_error: String::new() }
+        Self { mpv_path: mpv_path.into(), current: None, dismissed: None, extra_args: Vec::new(), margins: [0.0; 4], applied_margins: [0.0; 4], last_error: String::new(), retry_delay: std::time::Duration::from_secs(3), max_attempts: 5, attempts: 0, retry_at: None, last_want: None }
     }
 
     /// 映像ウィンドウが開いているか。
@@ -445,23 +454,37 @@ impl VideoFollower {
         if want.as_ref() != self.dismissed.as_ref() {
             self.dismissed = None;
         }
+        if want != self.last_want {
+            // 曲が変わった・止まった: 起動の再試行はやり直し
+            self.attempts = 0;
+            self.retry_at = None;
+            self.last_want = want.clone();
+        }
         if self.current.as_ref().map(|(p, _)| p) != want.as_ref() {
             self.close();
         }
         let Some(path) = want else { return };
-        if self.current.is_none() && self.dismissed.as_deref() != Some(path.as_str()) {
+        let waiting = self.retry_at.is_some_and(|t| std::time::Instant::now() < t);
+        if self.current.is_none() && self.dismissed.as_deref() != Some(path.as_str()) && !waiting {
             match {
                 let extra: Vec<&str> = self.extra_args.iter().map(String::as_str).collect();
-                spawn_mpv(&self.mpv_path, &path, st.position_secs, 0.0, 10.0, &extra)
+                spawn_mpv(&self.mpv_path, &path, st.position_secs, 0.0, 20.0, &extra)
             } {
                 Ok(m) => {
                     self.applied_margins = [0.0; 4];
                     self.current = Some((path.clone(), m));
                     self.last_error.clear();
+                    self.attempts = 0;
+                    self.retry_at = None;
                 }
                 Err(e) => {
+                    self.attempts += 1;
                     self.last_error = format!("{e}(mpvのパスは環境変数 OPEN_BAR_MPV で指定 / set OPEN_BAR_MPV)");
-                    self.dismissed = Some(path);
+                    if self.attempts >= self.max_attempts {
+                        self.dismissed = Some(path);
+                    } else {
+                        self.retry_at = Some(std::time::Instant::now() + self.retry_delay);
+                    }
                     return;
                 }
             }
