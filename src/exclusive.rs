@@ -99,7 +99,8 @@ impl ExclusiveDevice {
         let container_bytes = block / channels;
         let (_def, min_period) = client.get_device_period().map_err(werr)?;
         // 周期は長め(最低でも約10ms)にして、Windowsのスケジューリングの揺れで音が途切れにくくする(遅延は気にしない用途)。
-        let wanted = (3 * min_period / 2).max(100_000);
+        // 20ms以上に延ばす(USB DACはバス周期が粗く、短い周期だとXMOS等でプチノイズの原因になりうる)。
+        let wanted = (3 * min_period / 2).max(200_000);
         let period = client.calculate_aligned_period_near(wanted, Some(128), &fmt).map_err(werr)?;
         client
             .initialize_client(&fmt, Direction::Render, StreamMode::EventsExclusive { period_hns: period }, None)

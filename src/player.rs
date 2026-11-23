@@ -466,6 +466,12 @@ fn producer(track: Arc<Track>, src: Arc<dyn Source>) {
         }
         if let Some(t) = &mut treble {
             t.process_interleaved(&mut out, track.out_ch);
+            // 高音を持ち上げた分、山が1.0を超えて硬く切られる(ジー・ザラつき)のを防ぐため、-3dBの余裕を取る。
+            // 音量が約3dB下がるので、必要なら音量を上げる。
+            const TREBLE_HEADROOM: f32 = 0.707;
+            for s in out.iter_mut() {
+                *s *= TREBLE_HEADROOM;
+            }
         }
         track.ring.lock().unwrap().extend(out);
     }
