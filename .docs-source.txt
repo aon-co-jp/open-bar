@@ -1,3 +1,3 @@
 source: aon-co-jp/open-bar
-commit: c7f501b6b6b7050eef6cf6474b52a1fd55e0d671
-updated: 2026-11-20T05:19:02Z
+commit: 71148bbf4cd0bd258d2a3076065bae11802e6902
+updated: 2026-11-23T10:23:46Z

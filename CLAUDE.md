@@ -251,3 +251,8 @@ Reading into `serde_json::Value` gives almost no speed-up even with SIMD (188 ms
 ## 2026-11-20 依存の更新(version-control通知) / Dependency update
 - **日本語**: sonic-rs 0.3→0.5(`app/src-tauri`と`server`)。コードの変更は不要。あわせて、ureq 3がJSONを整形して送るために以前から失敗していた試験`a_beat_reaches_a_real_local_server_with_the_expected_fields`を、空白に左右されない比較に直した。試験9件成功。
 - **English**: sonic-rs 0.3 -> 0.5 (`app/src-tauri` and `server`); no code changes. Also fixed the test `a_beat_reaches_a_real_local_server_with_the_expected_fields`, which already failed before because ureq 3 pretty-prints the JSON body; it now compares without whitespace. 9 tests pass.
+
+
+## 2026-11-23 追記: url 2.5.9 へ更新 / Update: url 2.5.9
+**日本語**: RUSTSEC-2026-0592(`Url::origin()` のスタックあふれ)対応で `url` を 2.5.8→2.5.9 に更新(全試験成功(直列 --test-threads=1: 46+12+5件)。未コミットの映像位置補正(src/video.rs・tests/video_mpv.rs)は触っていない)。VPS のクローンも追従済み。稼働バイナリは未入れ替え。再開時は未コミットの作業中変更の有無を `git status` で確認。
+**English**: Updated `url` 2.5.8 to 2.5.9 for RUSTSEC-2026-0592 (stack overflow in `Url::origin()`); all tests pass serially (--test-threads=1: 46+12+5); the uncommitted video-offset work (src/video.rs, tests/video_mpv.rs) was left untouched. The VPS clone is fast-forwarded; running binaries were not swapped. On resume, check `git status` for uncommitted work.
