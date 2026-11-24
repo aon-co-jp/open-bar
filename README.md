@@ -1,3 +1,5 @@
+> Latest translations / 翻訳の最新版: [0-LATEST-TRANSLATIONS.md](0-LATEST-TRANSLATIONS.md)
+
 # open-bar
 
 [English](#english) / 日本語
